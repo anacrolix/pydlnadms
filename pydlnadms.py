@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
-import collections, heapq, logging, platform, select, socket, struct, sys, time
+import collections, heapq, logging, os, pdb, platform, select, socket, struct, \
+    sys, time
+from xml.etree import ElementTree as etree
 
 def make_xml_service_description(actions, statevars):
     from xml.etree.ElementTree import Element, tostring, SubElement
@@ -19,10 +21,15 @@ def make_xml_service_description(actions, statevars):
             SubElement(argument, 'direction').text = dir
             SubElement(argument, 'relatedStateVariable').text = var
     serviceStateTable = SubElement(scpd, 'serviceStateTable')
-    for name, datatype in statevars:
+    for name, datatype, *rest in statevars:
         stateVariable = SubElement(serviceStateTable, 'stateVariable', sendEvents='no')
         SubElement(stateVariable, 'name').text = name
         SubElement(stateVariable, 'dataType').text = datatype
+        if rest:
+            assert len(rest) == 1
+            allowedValueList = SubElement(stateVariable, 'allowedValueList')
+            for av in rest[0]:
+                SubElement(allowedValueList, 'allowedValue').text = av
     return tostring(scpd).encode('utf-8')
 
 EXPIRY_FUDGE = 10
@@ -33,7 +40,10 @@ UPNP_DOMAIN_NAME = 'schemas-upnp-org'
 ROOT_DESC_PATH = '/rootDesc.xml'
 SERVER_FIELD = '{}/{} DLNADOC/1.50 UPnP/1.0 MiniDLNA/1.0'.format(
     *platform.linux_distribution()[0:2])
-ROOT_DEVICE = 'urn:schemas-upnp-org:device:MediaServer:1'
+ROOT_DEVICE_DEVICE_TYPE = 'urn:schemas-upnp-org:device:MediaServer:1'
+ROOT_DEVICE_FRIENDLY_NAME = 'Anacrolix fucking serveR!!'
+ROOT_DEVICE_MANUFACTURER = 'Matt Joiner'
+ROOT_DEVICE_MODEL_NAME = 'pydlnadms 0.1'
 DEVICE_DESC_SERVICE_FIELDS = 'serviceType', 'serviceId', 'SCPDURL', 'controlURL', 'eventSubURL'
 CONTENT_DIRECTORY_CONTROL_URL = '/ctl/ContentDirectory'
 Service = collections.namedtuple(
@@ -44,8 +54,19 @@ SERVICE_LIST = []
 for service, domain, version, actions, statevars in [
         ('ContentDirectory', None, 1, [
             ('Browse', [
-                ('ObjectID', 'in', 'A_ARG_TYPE_ObjectID')])], [
-            ('A_ARG_TYPE_ObjectID', 'string')]),
+                ('ObjectID', 'in', 'A_ARG_TYPE_ObjectID'),
+                ('BrowseFlag', 'in', 'A_ARG_TYPE_BrowseFlag'),
+                ('StartingIndex', 'in', 'A_ARG_TYPE_Index'),
+                ('RequestedCount', 'in', 'A_ARG_TYPE_Count'),
+                ('Result', 'out', 'A_ARG_TYPE_Result'),
+                ('NumberReturned', 'out', 'A_ARG_TYPE_Count'),
+                ('TotalMatches', 'out', 'A_ARG_TYPE_Count')])], [
+            ('A_ARG_TYPE_ObjectID', 'string'),
+            ('A_ARG_TYPE_Result', 'string'),
+            ('A_ARG_TYPE_BrowseFlag', 'string', [
+                'BrowseMetadata', 'BrowseDirectChildren']),
+            ('A_ARG_TYPE_Index', 'ui4'),
+            ('A_ARG_TYPE_Count', 'ui4')]),
         ('ConnectionManager', None, 1, (), ()),
         ('X_MS_MediaReceiverRegistrar', 'microsoft.com', 1, (), ()),]:
     SERVICE_LIST.append(Service(
@@ -70,10 +91,10 @@ def make_device_desc(udn):
     SubElement(specVersion, 'minor').text = '0'
     #SubElement(root, 'URLBase').text =
     device = SubElement(root, 'device')
-    SubElement(device, 'deviceType').text = ROOT_DEVICE
-    SubElement(device, 'friendlyName').text = 'Hello World!'
-    SubElement(device, 'manufacturer').text = 'Matt Joiner'
-    SubElement(device, 'modelName').text = 'pydlnadms 0.1'
+    SubElement(device, 'deviceType').text = ROOT_DEVICE_DEVICE_TYPE
+    SubElement(device, 'friendlyName').text = ROOT_DEVICE_FRIENDLY_NAME
+    SubElement(device, 'manufacturer').text = ROOT_DEVICE_MANUFACTURER
+    SubElement(device, 'modelName').text = ROOT_DEVICE_MODEL_NAME
     SubElement(device, 'UDN').text = udn
     serviceList = SubElement(device, 'serviceList')
     for service in SERVICE_LIST:
@@ -259,19 +280,30 @@ def http_response(headers, body=b''):
 def rfc1123_date():
     return time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
 
-def soap_action_response(action_name, arguments):
+def soap_action_response(service_type, action_name, arguments):
     return '''<?xml version="1.0"?>
 <s:Envelope
 xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
 s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 <s:Body>
-<u:{actionName}Response xmlns:u="urn:schemas-upnp-org:service:serviceType:v">
+<u:{actionName}Response xmlns:u="{serviceType}">
 {argumentXML}
 </u:{actionName}Response>
 </s:Body>
-</s:Envelope>'''.format(actionName=action_name, argumentXML='\n'.join(['<{argumentName}>{value}</{argumentName}>'.format(argumentName=name, value=value) for name, value in arguments]))
+</s:Envelope>'''.format(
+        actionName=action_name,
+        argumentXML='\n'.join([
+            '<{argumentName}>{value}</{argumentName}>'.format(
+                argumentName=name, value=value) for name, value in arguments]),
+        serviceType=service_type)
 
-#def didl_lite(
+def didl_lite(content):
+    return ('''<DIDL-Lite
+            xmlns:dc="http://purl.org/dc/elements/1.1/"
+            xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"
+            xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
+            xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">
+        ''' + content + r'</DIDL-Lite>')
 
 class HTTPConnection:
 
@@ -281,15 +313,21 @@ class HTTPConnection:
         self.root_device = root_device
         self.closed = False
 
+    def send(self, data):
+        sent = self.socket.send(data)
+        assert sent == len(data), (sent, len(data))
+
     def send_description(self, desc):
         data = http_response((
                 ('CONTENT-LENGTH', str(len(desc))),
                 ('CONTENT-TYPE', 'text/xml'),
                 ('DATE', rfc1123_date()),
             ), desc)
-        sent = self.socket.send(data)
-        assert sent == len(data)
-        logging.debug('Sent description %s->%s: %r', self.socket.getsockname(), self.socket.getpeername(), data)
+        self.send(data)
+        logging.debug('Sent description %s->%s: %r',
+            self.socket.getsockname(),
+            self.socket.getpeername(),
+            data)
 
     def close(self):
         peername = self.socket.getpeername()
@@ -297,9 +335,58 @@ class HTTPConnection:
         self.closed = True
         logging.debug('HTTP connection with %s was closed', peername)
 
-    def browse_action(self):
-        # omfg WHAT THE FUCK IS 'DUBLIN CORE' SMOKING?
-        pass
+        a = '\n<container id="64" parentID="0" restricted="1" childCount="2"><dc:title>Browse Folders</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="1" parentID="0" restricted="1" childCount="6"><dc:title>Music</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="3" parentID="0" restricted="1" childCount="4"><dc:title>Pictures</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="2" parentID="0" restricted="1" childCount="2"><dc:title>Video</dc:title><upnp:class>object.container.storageFolder</upnp:class></container>'
+
+    def browse_result(self, parent_id, start_index, requested_count):
+        from xml.etree.ElementTree import Element, SubElement
+        elements = []
+        base_path = '/media/data/seen'
+        all_entries = os.listdir(base_path)
+        end_index = start_index + requested_count if requested_count else None
+        for id, entry in enumerate(all_entries[start_index:end_index], 1):
+            path = os.path.join(base_path, entry)
+            isdir = os.path.isdir(path)
+            entry_elt = Element('container' if isdir else 'item', id=str(id), parentID=str(parent_id), restricted='1')
+            elements.append(entry_elt)
+            if isdir:
+                entry_elt.set('childCount', str(len(os.listdir(path))))
+            SubElement(entry_elt, 'dc:title').text = entry
+            class_elt = SubElement(entry_elt, 'upnp:class')
+            if isdir:
+                class_elt.text = 'object.container.storageFolder'
+            else:
+                class_elt.text = 'object.item'
+        return elements, len(all_entries)
+
+    def process_soap_action(self, soap_action, soap_request):
+        from xml.sax.saxutils import escape
+        # we're already looking at the envelope, perhaps I should wrap this with
+        # a Document so that absolute lookup is done instead? TODO
+        action_elt = soap_request.find(
+            '{{{s}}}Body/{{{u}}}{action}'.format(
+                s='http://schemas.xmlsoap.org/soap/envelope/',
+                u=soap_action.service_type,
+                action=soap_action.action))
+        if soap_action.action == 'Browse':
+            result_elements, total_matches = self.browse_result(
+                0, int(action_elt.find('StartingIndex').text),
+                int(action_elt.find('RequestedCount').text))
+            response_body = soap_action_response(soap_action.service_type, soap_action.action, [
+                    ('Result', escape(didl_lite(''.join(
+                        etree.tostring(elt) for elt in result_elements)))),
+                    ('NumberReturned', len(result_elements)),
+                    ('TotalMatches', total_matches),
+                    #('UpdateID', 10)],
+                ]).encode('utf-8')
+            self.send(http_response([
+                ('CONTENT-LENGTH', str(len(response_body))),
+                ('CONTENT-TYPE', 'text/xml; charset="utf-8"'),
+                ('DATE', rfc1123_date()),
+                ('EXT', ''),
+                ('SERVER', SERVER_FIELD)], response_body))
+            logging.debug('Sent Browse response: %r', response_body)
+        #pdb.set_trace()
+        self.close()
 
     def on_read_event(self):
         data = self.socket.recv(0x1000)
@@ -324,12 +411,8 @@ class HTTPConnection:
         elif request.method in ['POST']:
             if request.path in (service.controlURL for service in SERVICE_LIST):
                 soap_action = parse_soap_action_header_value(request['soapaction'])
-                if soap_action.action == 'GetSortCapabilities':
-                    self.close()
-                    return
-                elif soap_action.action == 'Browse':
-                    self.browse_action()
-                    return
+                self.process_soap_action(soap_action, etree.fromstring(data))
+                return
         self.close()
 
     def fileno(self):
@@ -341,7 +424,16 @@ class HTTPServer:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         # TODO allow binding to specific interfaces
-        self.socket.bind(('', 8200))
+        port = 8200
+        while True:
+            try:
+                self.socket.bind(('', port))
+            except socket.error as exc:
+                if exc.errno != 98:
+                    raise
+            else:
+                break
+            port += 1
         # TODO use the socket backlog default
         self.socket.listen(5)
         self.master = master
@@ -404,7 +496,7 @@ class DMS:
     def all_targets(self):
         yield UPNP_ROOT_DEVICE
         yield self.device_uuid
-        yield ROOT_DEVICE
+        yield ROOT_DEVICE_DEVICE_TYPE
         for service in SERVICE_LIST:
             yield service.serviceType
 
