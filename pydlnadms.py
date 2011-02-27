@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import collections, logging, platform, select, socket, struct, sys, time
+import collections, heapq, logging, platform, select, socket, struct, sys, time
 
 def make_xml_service_description(actions, statevars):
     from xml.etree.ElementTree import Element, tostring, SubElement
@@ -9,9 +9,23 @@ def make_xml_service_description(actions, statevars):
     SubElement(specVersion, 'major').text = '1'
     SubElement(specVersion, 'minor').text = '0'
     actionList = SubElement(scpd, 'actionList')
+    for action in actions:
+        action_elt = SubElement(actionList, 'action')
+        SubElement(action_elt, 'name').text = action[0]
+        argumentList = SubElement(action_elt, 'argumentList')
+        for name, dir, var in action[1]:
+            argument = SubElement(argumentList, 'argument')
+            SubElement(argument, 'name').text = name
+            SubElement(argument, 'direction').text = dir
+            SubElement(argument, 'relatedStateVariable').text = var
     serviceStateTable = SubElement(scpd, 'serviceStateTable')
+    for name, datatype in statevars:
+        stateVariable = SubElement(serviceStateTable, 'stateVariable', sendEvents='no')
+        SubElement(stateVariable, 'name').text = name
+        SubElement(stateVariable, 'dataType').text = datatype
     return tostring(scpd).encode('utf-8')
 
+EXPIRY_FUDGE = 10
 SSDP_PORT = 1900
 SSDP_MCAST_ADDR = '239.255.255.250'
 UPNP_ROOT_DEVICE = 'upnp:rootdevice'
@@ -21,13 +35,17 @@ SERVER_FIELD = '{}/{} DLNADOC/1.50 UPnP/1.0 MiniDLNA/1.0'.format(
     *platform.linux_distribution()[0:2])
 ROOT_DEVICE = 'urn:schemas-upnp-org:device:MediaServer:1'
 DEVICE_DESC_SERVICE_FIELDS = 'serviceType', 'serviceId', 'SCPDURL', 'controlURL', 'eventSubURL'
+CONTENT_DIRECTORY_CONTROL_URL = '/ctl/ContentDirectory'
 Service = collections.namedtuple(
     'Service',
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
 
 SERVICE_LIST = []
 for service, domain, version, actions, statevars in [
-        ('ContentDirectory', None, 1, (), ()),
+        ('ContentDirectory', None, 1, [
+            ('Browse', [
+                ('ObjectID', 'in', 'A_ARG_TYPE_ObjectID')])], [
+            ('A_ARG_TYPE_ObjectID', 'string')]),
         ('ConnectionManager', None, 1, (), ()),
         ('X_MS_MediaReceiverRegistrar', 'microsoft.com', 1, (), ()),]:
     SERVICE_LIST.append(Service(
@@ -41,6 +59,8 @@ for service, domain, version, actions, statevars in [
         eventSubURL='/evt/'+service,
         xmlDescription=make_xml_service_description(actions, statevars)))
 del service, domain, version
+
+print(SERVICE_LIST)
 
 def make_device_desc(udn):
     from xml.etree.ElementTree import Element, tostring, SubElement
@@ -63,33 +83,195 @@ def make_device_desc(udn):
     return tostring(root).encode('utf-8')
 
 
-class SSDP:
-    def __init__(self, host):
-        self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
-        self.recv_sock.bind((host, SSDP_PORT))
-        mreq = struct.pack('4sI', socket.inet_aton(SSDP_MCAST_ADDR), socket.INADDR_ANY)
-        self.recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+class SSDPSender:
+
+    def __init__(self, host, master):
         #for if_addr in if_addrs:
-        self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # don't loop back multicast packets to the local sockets
-        self.send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
         # perhaps the local if should be the host?
         mreq = struct.pack('II', socket.INADDR_ANY, socket.INADDR_ANY)
-        self.send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
-        self.send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
-        self.send_sock.bind((host, 0))
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
+        s.bind((host, 0))
+        self.socket = s
+        self.master = master
+
+    def fileno(self):
+        return self.socket.fileno()
 
 
-def make_http_response(protocol, code, reason, fields):
+class SSDPReceiver:
+
+    def __init__(self, host, master):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+        s.bind((host, SSDP_PORT))
+        mreq = struct.pack('4sI', socket.inet_aton(SSDP_MCAST_ADDR), socket.INADDR_ANY)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        self.socket = s
+        self.master = master
+        self.closed = False
+
+    def fileno(self):
+        return self.socket.fileno()
+
+    def on_read_event(self):
+        data, addr = self.socket.recvfrom(0x1000)
+        assert len(data) < 0x1000
+        logging.debug('Received SSDP Request from %s: %r', addr, data)
+        self.master.process_request(data, addr)
+
+class SSDP:
+
+    def __init__(self, host, device):
+        self.host = host
+        self.sender = SSDPSender(host, self)
+        self.receiver = SSDPReceiver(host, self)
+        self.device = device
+
+    @property
+    def all_targets(self):
+        return self.device.all_targets
+
+    @property
+    def notify_interval(self):
+        return self.device.notify_interval
+
+    def send(self, data, addr):
+        self.sender.socket.sendto(data, addr)
+
+    def send_goodbye(self):
+        for nt in self.device.all_targets:
+            buf = http_request('NOTIFY', '*', (
+                ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
+                ('NT', nt),
+                ('USN', self.device.usn_from_target(nt)),
+                ('NTS', 'ssdp:byebye'),))
+            self.send(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
+            logging.debug('Sent ssdp:byebye: %r', buf)
+
+    def send_notify(self):
+        for nt in self.all_targets:
+            data = http_request('NOTIFY', '*', (
+                ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
+                ('CACHE-CONTROL', 'max-age={:d}'.format(
+                    self.device.alive_interval * 2 + EXPIRY_FUDGE)),
+                ('LOCATION', 'http://{0[0]}:{0[1]:d}{1}'.format(
+                    self.http_address, ROOT_DESC_PATH)),
+                ('NT', nt),
+                ('NTS', 'ssdp:alive'),
+                ('SERVER', SERVER_FIELD),
+                ('USN', self.usn_from_target(nt))))
+            self.send(data, (SSDP_MCAST_ADDR, SSDP_PORT))
+            logging.debug('Sent ssdp:alive: %r', data)
+
+    def process_request(self, data, addr):
+        lines = data.decode('utf-8').split('\r\n')
+        if not lines[0].startswith('M-SEARCH'):
+            return
+        for line in lines[1:]:
+            if line.startswith('ST:'):
+                st = line[3:].strip()
+        if st == 'ssdp:all':
+            sts = self.all_targets
+        else:
+            sts = [st]
+        for st in sts:
+            self.send_msearch_reply(addr, st)
+
+    @property
+    def http_address(self):
+        return (
+            self.receiver.socket.getsockname()[0],
+            self.device.http_server.socket.getsockname()[1])
+
+    @property
+    def usn_from_target(self):
+        return self.device.usn_from_target
+
+    @property
+    def max_age(self):
+        return self.device.alive_interval * 2 + EXPIRY_FUDGE
+
+    def send_msearch_reply(self, addr, st):
+        data = http_response((
+            ('CACHE-CONTROL', 'max-age={:d}'.format(self.max_age)),
+            ('DATE', time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())),
+            ('EXT', ''),
+            ('LOCATION', 'http://{0[0]}:{0[1]:d}{1}'.format(
+                self.http_address,
+                ROOT_DESC_PATH)),
+            ('SERVER', SERVER_FIELD),
+            ('ST', st),
+            ('USN', self.usn_from_target(st)),))
+        self.send(data, addr)
+        logging.debug('Responded to M-SEARCH from %s: %r', addr, data)
+
+class SOAPActionHeader: pass
+
+def parse_soap_action_header_value(value):
+    assert value[0] == '"' and value[-1] == '"', value
+    service_type, action = value[1:-1].rsplit('#', 1)
+    sa = SOAPActionHeader()
+    sa.service_type = service_type
+    sa.action = action
+    return sa
+
+class HTTPRequest:
+
+    __slots__ = 'method', 'path', 'protocol', 'headers'
+
+    def __init__(self):
+        self.headers = {}
+
+    def __setitem__(self, key, value):
+        self.headers[key.upper()] = value.strip()
+
+    def __getitem__(self, key):
+        return self.headers[key.upper()]
+
+    @classmethod
+    def from_bytes(cls, data):
+        request = cls()
+        header_buf, data = data.split(b'\r\n\r\n', 1)
+        lines = header_buf.decode('utf-8').split('\r\n')
+        request.method, request.path, request.protocol = lines[0].split()
+        for h in lines[1:]:
+            name, value = h.split(':', 1)
+            request[name] = value
+        return request, data
+
+def httpify_headers(headers):
     from itertools import chain
-    return '\r\n'.join(chain(
-        ('{} {} {}'.format(protocol, code, reason),),
-        (': '.join(f) for f in fields),
-        ('', '')))
+    return '\r\n'.join(': '.join(h) for h in chain(headers, ('',)))
+
+def http_message(first_line, headers, body):
+    return (first_line + '\r\n' + httpify_headers(headers) + '\r\n').encode('utf-8') + body
+
+def http_request(method, path, headers, body=b''):
+    return http_message(' '.join((method, path, 'HTTP/1.1')), headers, body)
+
+def http_response(headers, body=b''):
+    return http_message('HTTP/1.1 200 OK', headers, body)
 
 def rfc1123_date():
     return time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
+
+def soap_action_response(action_name, arguments):
+    return '''<?xml version="1.0"?>
+<s:Envelope
+xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:{actionName}Response xmlns:u="urn:schemas-upnp-org:service:serviceType:v">
+{argumentXML}
+</u:{actionName}Response>
+</s:Body>
+</s:Envelope>'''.format(actionName=action_name, argumentXML='\n'.join(['<{argumentName}>{value}</{argumentName}>'.format(argumentName=name, value=value) for name, value in arguments]))
+
+#def didl_lite(
 
 class HTTPConnection:
 
@@ -97,72 +279,126 @@ class HTTPConnection:
         self.socket = socket
         self.buffer = b''
         self.root_device = root_device
-        self.conns = root_device.http_conns
+        self.closed = False
 
     def send_description(self, desc):
-        data = make_http_response(
-            'HTTP/1.1', 200, 'OK', (
+        data = http_response((
                 ('CONTENT-LENGTH', str(len(desc))),
                 ('CONTENT-TYPE', 'text/xml'),
                 ('DATE', rfc1123_date()),
-            )).encode('utf-8') + desc
+            ), desc)
         sent = self.socket.send(data)
         assert sent == len(data)
         logging.debug('Sent description %s->%s: %r', self.socket.getsockname(), self.socket.getpeername(), data)
 
+    def close(self):
+        peername = self.socket.getpeername()
+        self.socket.close()
+        self.closed = True
+        logging.debug('HTTP connection with %s was closed', peername)
 
-    def handle_read(self):
+    def browse_action(self):
+        # omfg WHAT THE FUCK IS 'DUBLIN CORE' SMOKING?
+        pass
+
+    def on_read_event(self):
         data = self.socket.recv(0x1000)
         if not data:
-            self.conns.remove(self)
+            logging.debug('HTTP connection with %s closed by peer',
+                self.socket.getpeername())
+            self.socket.close()
+            self.closed = True
             return
         logging.debug('%s to %s: %r', self.socket.getpeername(), self.socket.getsockname(), data)
         self.buffer += data
-        header, body = self.buffer.split(b'\r\n\r\n', 1)
-        header = header.decode('utf-8')
-        fields = header.split('\r\n')
-        method, path, protocol = fields[0].split()
-        if method in ('GET', 'HEAD'):
-            if path == ROOT_DESC_PATH:
+        request, data = HTTPRequest.from_bytes(data)
+        assert not len(data) or len(data) == int(request['content-length'])
+        if request.method in ['GET', 'HEAD']:
+            if request.path == ROOT_DESC_PATH:
                 self.send_description(self.root_device.device_desc)
-            else:
-                for service in SERVICE_LIST:
-                    if path == service.SCPDURL:
-                        self.send_description(service.xmlDescription)
-                        break
+                return
+            for service in SERVICE_LIST:
+                if request.path == service.SCPDURL:
+                    self.send_description(service.xmlDescription)
+                    return
+        elif request.method in ['POST']:
+            if request.path in (service.controlURL for service in SERVICE_LIST):
+                soap_action = parse_soap_action_header_value(request['soapaction'])
+                if soap_action.action == 'GetSortCapabilities':
+                    self.close()
+                    return
+                elif soap_action.action == 'Browse':
+                    self.browse_action()
+                    return
+        self.close()
 
     def fileno(self):
         return self.socket.fileno()
+
+class HTTPServer:
+
+    def __init__(self, master):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+        # TODO allow binding to specific interfaces
+        self.socket.bind(('', 8200))
+        # TODO use the socket backlog default
+        self.socket.listen(5)
+        self.master = master
+        self.closed = False
+
+    def fileno(self):
+        return self.socket.fileno()
+
+    def on_read_event(self):
+        sock, addr = self.socket.accept()
+        logging.debug('Accepted connection from %s', addr)
+        self.master.on_server_accept(sock)
 
 class DMS:
 
     def __init__(self):
         logging.basicConfig(stream=sys.stderr, level=0)
-        self.ssdp = SSDP('')
+        self.ssdp = SSDP('192.168.24.9', self)
         # there is much more to it than this
-        self.device_uuid = 'uuid:00000000-0000-0000-0000-000000000000'
-        self.http_port = 8200
-        self.notify_interval = 895
+        self.device_uuid = 'uuid:deadbeef-0000-0000-0000-0000000b00b5'
+        self.alive_interval = 10
         self.device_desc = make_device_desc(self.device_uuid)
-        self.send_ssdp_goodbye()
-        self.http_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.http_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
-        self.http_sock.bind(('', 8200))
-        self.http_sock.listen(5)
+        self.ssdp.send_goodbye()
+        self.http_server = HTTPServer(self)
         self.http_conns = []
+        self.events = [(0, self.advertise)]
         while True:
-            r = [self.ssdp.recv_sock, self.http_sock] + self.http_conns
-            r, w, x = select.select(r, [], [])
-            if self.ssdp.recv_sock in r:
-                self.process_ssdp_request()
-            if self.http_sock in r:
-                sock, addr = self.http_sock.accept()
-                logging.debug('Accepted connection from %s', addr)
-                self.http_conns.append(HTTPConnection(sock, self))
-            for http_conn in self.http_conns:
-                if http_conn not in r:
-                    continue
-                http_conn.handle_read()
+            r = [self.http_server, self.ssdp.receiver] + self.http_conns
+            while True:
+                if self.events:
+                    timeout = self.events[0][0] - time.time()
+                    if timeout >= 0:
+                        break
+                    heapq.heappop(self.events)[1]()
+                else:
+                    timeout = None
+                    break
+                del timeout
+            logging.debug('Polling with timeout: %s', timeout)
+            r, w, x = select.select(r, [], [], timeout)
+            assert not w and not x
+            if not r:
+                logging.debug('Select returned no events')
+            for channel in r:
+                channel.on_read_event()
+                if channel.closed:
+                    self.http_conns.remove(channel)
+
+    def add_event(self, delay, callback):
+        heapq.heappush(self.events, (time.time() + delay, callback))
+
+    def advertise(self):
+        self.ssdp.send_notify()
+        self.add_event(self.alive_interval, self.advertise)
+
+    def on_server_accept(self, sock):
+        self.http_conns.append(HTTPConnection(sock, self))
 
     @property
     def all_targets(self):
@@ -172,224 +408,11 @@ class DMS:
         for service in SERVICE_LIST:
             yield service.serviceType
 
-    def send_ssdp_goodbye(self):
-        def send_message(nt, usn):
-            buf = '\r\n'.join([
-                'NOTIFY * HTTP/1.1',
-                'HOST:{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT),
-                'NT:' + nt,
-                'USN:' + usn,
-                'NTS:ssdp:byebye',
-                '', '']).encode('utf-8')
-            self.ssdp.send_sock.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
-            logging.debug('Sent ssdp:byebye: %r', buf)
-        for nt in self.all_targets:
-            send_message(nt, self.usn_from_target(nt))
-
-    def send_ssdp_notify(self):
-        def send_message(nt, usn):
-            buf = '\r\n'.join([
-                'NOTIFY * HTTP/1.1',
-                'HOST:{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT),
-                'CACHE-CONTROL:max-age={:u}'.format(self.notify_interval * 2 + 10),
-                'LOCATION:http://{}:{:d}{}'.format(host, port, ROOT_DESC_PATH),
-                'SERVER: ' + SERVER_FIELD,
-                'NT:' + nt,
-                'USN:' + usn,
-                'NTS:ssdp:alive',
-                '', '']).encode('utf-8')
-            self.ssdpsend.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
-        for nt in (UPNP_ROOT_DEVICE, ROOT_DEVICE,) + SERVICES:
-            send_message(nt, self.device_uuid + '::' + nt)
-        send_message(self.device_uiid, self.device_uuid)
-
     def usn_from_target(self, target):
         if target == self.device_uuid:
             return target
         else:
             return self.device_uuid + '::' + target
-
-    def process_ssdp_request(self):
-        data, addr = self.ssdp.recv_sock.recvfrom(0x1000)
-        logging.debug('Received UDP packet from %s: %r', addr, data)
-        fields = data.decode('utf-8').split('\r\n')
-        if not fields[0].startswith('M-SEARCH'):
-            return
-        for field in fields:
-            if field.startswith('ST:'):
-                st = field[3:].lstrip()
-        if st == 'ssdp:all':
-            sts = self.all_targets
-        else:
-            sts = [st]
-        for st in sts:
-            self.send_ssdp_msearch_reply(addr, st)
-
-    def send_ssdp_msearch_reply(self, addr, st):
-        buf = '\r\n'.join([
-            'HTTP/1.1 200 OK',
-            'CACHE-CONTROL: max-age={:d}'.format(self.notify_interval * 2 + 10),
-            'DATE: ' + time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime()),
-            'EXT:',
-            'ST: ' + st,
-            'USN: ' + self.usn_from_target(st),
-            'SERVER: ' + SERVER_FIELD,
-            'LOCATION: http://{}:{:d}{}'.format(self.ssdp.recv_sock.getsockname()[0], self.http_port, ROOT_DESC_PATH),
-            'Content-Length: 0',
-            '', '']).encode('utf-8')
-        self.ssdp.send_sock.sendto(buf, addr)
-        logging.debug('Responded to M-SEARCH from %s: %r', addr, buf)
-
-
-#/* ProcessSSDPRequest()
- #* process SSDP M-SEARCH requests and responds to them */
-#void
-#ProcessSSDPRequest(int s, unsigned short port)
-#/*ProcessSSDPRequest(int s, struct lan_addr_s * lan_addr, int n_lan_addr,
-                   #unsigned short port)*/
-#{
-	#int n;
-	#char bufr[1500];
-	#socklen_t len_r;
-	#struct sockaddr_in sendername;
-	#int i, l;
-	#int lan_addr_index = 0;
-	#char * st = NULL, * mx = NULL, * man = NULL, * mx_end = NULL;
-	#int st_len = 0, mx_len = 0, man_len = 0, mx_val = 0;
-	#len_r = sizeof(struct sockaddr_in);
-
-	#n = recvfrom(s, bufr, sizeof(bufr), 0,
-	             #(struct sockaddr *)&sendername, &len_r);
-	#if(n < 0)
-	#{
-		#DPRINTF(E_ERROR, L_SSDP, "recvfrom(udp): %s\n", strerror(errno));
-		#return;
-	#}
-
-	#if(memcmp(bufr, "NOTIFY", 6) == 0)
-	#{
-		#/* ignore NOTIFY packets. We could log the sender and device type */
-		#return;
-	#}
-	#else if(memcmp(bufr, "M-SEARCH", 8) == 0)
-	#{
-		#//DEBUG DPRINTF(E_DEBUG, L_SSDP, "Received SSDP request:\n%.*s", n, bufr);
-		#for(i=0; i < n; i++)
-		#{
-			#if( bufr[i] == '*' )
-				#break;
-		#}
-		#if( !strcasestr(bufr+i, "HTTP/1.1") )
-		#{
-			#return;
-		#}
-		#while(i < n)
-		#{
-			#while((i < n - 1) && (bufr[i] != '\r' || bufr[i+1] != '\n'))
-				#i++;
-			#i += 2;
-			#if((i < n - 3) && (strncasecmp(bufr+i, "ST:", 3) == 0))
-			#{
-				#st = bufr+i+3;
-				#st_len = 0;
-				#while(*st == ' ' || *st == '\t') st++;
-				#while(st[st_len]!='\r' && st[st_len]!='\n') st_len++;
-			#}
-			#else if(strncasecmp(bufr+i, "MX:", 3) == 0)
-			#{
-				#mx = bufr+i+3;
-				#mx_len = 0;
-				#while(*mx == ' ' || *mx == '\t') mx++;
-				#while(mx[mx_len]!='\r' && mx[mx_len]!='\n') mx_len++;
-        			#mx_val = strtol(mx, &mx_end, 10);
-			#}
-			#else if(strncasecmp(bufr+i, "MAN:", 4) == 0)
-			#{
-				#man = bufr+i+4;
-				#man_len = 0;
-				#while(*man == ' ' || *man == '\t') man++;
-				#while(man[man_len]!='\r' && man[man_len]!='\n') man_len++;
-			#}
-		#}
-		#/*DPRINTF(E_INFO, L_SSDP, "SSDP M-SEARCH packet received from %s:%d\n",
-	           #inet_ntoa(sendername.sin_addr),
-	           #ntohs(sendername.sin_port) );*/
-		#if( ntohs(sendername.sin_port) <= 1024 || ntohs(sendername.sin_port) == 1900 )
-		#{
-			#DPRINTF(E_INFO, L_SSDP, "WARNING: Ignoring invalid SSDP M-SEARCH from %s [bad source port %d]\n",
-			   #inet_ntoa(sendername.sin_addr), ntohs(sendername.sin_port));
-		#}
-		#else if( !man || (strncmp(man, "\"ssdp:discover\"", 15) != 0) )
-		#{
-			#DPRINTF(E_INFO, L_SSDP, "WARNING: Ignoring invalid SSDP M-SEARCH from %s [bad MAN header %.*s]\n",
-			   #inet_ntoa(sendername.sin_addr), man_len, man);
-		#}
-		#else if( !mx || mx == mx_end || mx_val < 0 ) {
-			#DPRINTF(E_INFO, L_SSDP, "WARNING: Ignoring invalid SSDP M-SEARCH from %s [bad MX header %.*s]\n",
-			   #inet_ntoa(sendername.sin_addr), mx_len, mx);
-		#}
-		#else if( st && (st_len > 0) )
-		#{
-			#DPRINTF(E_INFO, L_SSDP, "SSDP M-SEARCH from %s:%d ST: %.*s, MX: %.*s, MAN: %.*s\n",
-	        	   #inet_ntoa(sendername.sin_addr),
-	           	   #ntohs(sendername.sin_port),
-			   #st_len, st, mx_len, mx, man_len, man);
-			#/* find in which sub network the client is */
-			#for(i = 0; i<n_lan_addr; i++)
-			#{
-				#if( (sendername.sin_addr.s_addr & lan_addr[i].mask.s_addr)
-				   #== (lan_addr[i].addr.s_addr & lan_addr[i].mask.s_addr))
-				#{
-					#lan_addr_index = i;
-					#break;
-				#}
-			#}
-			#/* Responds to request with a device as ST header */
-			#for(i = 0; known_service_types[i]; i++)
-			#{
-				#l = strlen(known_service_types[i]);
-				#if(l<=st_len && (0 == memcmp(st, known_service_types[i], l)))
-				#{
-					#/* Check version number - must always be 1 currently. */
-					#if( (st[st_len-2] == ':') && (atoi(st+st_len-1) != 1) )
-						#break;
-					#usleep(random()>>20);
-					#SendSSDPAnnounce2(s, sendername,
-					                  #i,
-					                  #lan_addr[lan_addr_index].str, port);
-					#break;
-				#}
-			#}
-			#/* Responds to request with ST: ssdp:all */
-			#/* strlen("ssdp:all") == 8 */
-			#if(st_len==8 && (0 == memcmp(st, "ssdp:all", 8)))
-			#{
-				#for(i=0; known_service_types[i]; i++)
-				#{
-					#l = (int)strlen(known_service_types[i]);
-					#SendSSDPAnnounce2(s, sendername,
-					                  #i,
-					                  #lan_addr[lan_addr_index].str, port);
-				#}
-			#}
-		#}
-		#else
-		#{
-			#DPRINTF(E_INFO, L_SSDP, "Invalid SSDP M-SEARCH from %s:%d\n",
-	        	   #inet_ntoa(sendername.sin_addr), ntohs(sendername.sin_port));
-		#}
-	#}
-	#else
-	#{
-		#DPRINTF(E_WARN, L_SSDP, "Unknown udp packet received from %s:%d\n",
-		       #inet_ntoa(sendername.sin_addr), ntohs(sendername.sin_port));
-	#}
-#}
-
-
-
-
-
 
 def main():
     DMS()
