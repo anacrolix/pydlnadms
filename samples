@@ -16,3 +16,12 @@ pnp:class&gt;&lt;/container&gt;&lt;/DIDL-Lite&gt;</Result>
 <NumberReturned>2</NumberReturned>
 <TotalMatches>61</TotalMatches>
 <UpdateID>0</UpdateID></u:BrowseResponse></s:Body></s:Envelope>
+
+<DIDL-Lite
+            xmlns:dc="http://purl.org/dc/elements/1.1/"
+            xmlns:upnp=”urn:schemas-upnp-org:metadata-1-0/upnp/”
+            xmlns=”urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/”>
+        <container childCount="8" id="1" parentID="0" restricted="1"><dc:title>05.27.08.Battle.of.the.Bulge.1965.x264.720p.AC3.HD.DVDRiP-CHD</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container childCount="7" id="2" parentID="0" restricted="1"><dc:title>127.Hours.2010.DVDSCR.AC3.XViD-T0XiC-iNK</dc:title><upnp:class>object.container.storageFolder</upnp:class></container></DIDL-Lite>
+
+        <DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">
+<container id="64" parentID="0" restricted="1" childCount="61"><dc:title>Browse Folders</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="1" parentID="0" restricted="1" childCount="6"><dc:title>Music</dc:title><upnp:class>object.container.storageFolder</upnp:class></container></DIDL-Lite>

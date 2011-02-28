@@ -110,11 +110,11 @@ class SSDPSender:
         #for if_addr in if_addrs:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # don't loop back multicast packets to the local sockets
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
+        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
         # perhaps the local if should be the host?
-        mreq = struct.pack('II', socket.INADDR_ANY, socket.INADDR_ANY)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
+        #mreq = struct.pack('II', socket.INADDR_ANY, socket.INADDR_ANY)
+        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
+        #s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
         s.bind((host, 0))
         self.socket = s
         self.master = master
@@ -129,8 +129,8 @@ class SSDPReceiver:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         s.bind((host, SSDP_PORT))
-        mreq = struct.pack('4sI', socket.inet_aton(SSDP_MCAST_ADDR), socket.INADDR_ANY)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        #mreq = struct.pack('4sI', socket.inet_aton(SSDP_MCAST_ADDR), socket.INADDR_ANY)
+        #s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         self.socket = s
         self.master = master
         self.closed = False
@@ -305,6 +305,82 @@ def didl_lite(content):
             xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">
         ''' + content + r'</DIDL-Lite>')
 
+#class CDPathObject:
+
+    #def __init__(self, id, parent_id, path):
+        #self.parent_id = parent_id
+        #self.path = path
+
+    #@property
+    #def xml(self):
+        #isdir = os.path.isdir(self.path)
+        #element = etree.Element(
+            #'container' if isdir else 'item',
+            #id=self.id,
+            #parentID=self.parent_id,
+            #restricted='1')
+        #if isdir:
+            #element.set('childCount', str(len(os.listdir(self.path))))
+        #SubElement(element, 'dc:title').text = os.path.basename(self.path)
+        #class_elt = SubElement(element, 'upnp:class')
+        #if isdir:
+            #class_elt.text = 'object.container.storageFolder'
+        #else:
+            #class_elt.text = 'object.item.videoItem'
+        #return etree.tostring(element)
+
+#class Objects:
+
+    #def __init__(self):
+        #self.id_to_object = {}
+        #self.path_to_id = {}
+        #self.next_id = 0
+
+    #def add_path(self, path):
+        #self.map[self.next_id] = PathObject(path)
+
+    #def by_path(self, path):
+
+#objects = Objects()
+#objects.add_path('/media/data/towatch')
+
+def cd_object_xml(path, parent_id):
+    isdir = os.path.isdir(path)
+    element = etree.Element(
+        'container' if isdir else 'item',
+        id=path, parentID=parent_id, restricted='1')
+    if isdir:
+        element.set('childCount', str(len(os.listdir(path))))
+    etree.SubElement(element, 'dc:title').text = os.path.basename(path)
+    class_elt = etree.SubElement(element, 'upnp:class')
+    if isdir:
+        class_elt.text = 'object.container.storageFolder'
+    else:
+        class_elt.text = 'object.item.videoItem'
+    res_elt = etree.SubElement(element, 'res',
+            protocolInfo='http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0'
+        ).text = 'http://192.168.24.9/res' + path
+    return etree.tostring(element)
+
+def cd_browse_result(**soap_args):
+    """(list of CD objects in XML, total possible elements)"""
+    path = soap_args['ObjectID']
+    if path == '0':
+        path = '/media/data/towatch'
+    if soap_args['BrowseFlag'] == 'BrowseDirectChildren':
+        entries = os.listdir(path)
+        start = int(soap_args['StartingIndex'])
+        count = int(soap_args['RequestedCount'])
+        end = start + count if count else None
+        elements = []
+        for entry in entries[start:end]:
+            elements.append(cd_object_xml(
+                os.path.join(path, entry),
+                soap_args['ObjectID']))
+        return elements, len(entries)
+    else:
+        assert False, soap_args['BrowseFlag']
+
 class HTTPConnection:
 
     def __init__(self, socket, root_device):
@@ -337,27 +413,6 @@ class HTTPConnection:
 
         a = '\n<container id="64" parentID="0" restricted="1" childCount="2"><dc:title>Browse Folders</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="1" parentID="0" restricted="1" childCount="6"><dc:title>Music</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="3" parentID="0" restricted="1" childCount="4"><dc:title>Pictures</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="2" parentID="0" restricted="1" childCount="2"><dc:title>Video</dc:title><upnp:class>object.container.storageFolder</upnp:class></container>'
 
-    def browse_result(self, parent_id, start_index, requested_count):
-        from xml.etree.ElementTree import Element, SubElement
-        elements = []
-        base_path = '/media/data/seen'
-        all_entries = os.listdir(base_path)
-        end_index = start_index + requested_count if requested_count else None
-        for id, entry in enumerate(all_entries[start_index:end_index], 1):
-            path = os.path.join(base_path, entry)
-            isdir = os.path.isdir(path)
-            entry_elt = Element('container' if isdir else 'item', id=str(id), parentID=str(parent_id), restricted='1')
-            elements.append(entry_elt)
-            if isdir:
-                entry_elt.set('childCount', str(len(os.listdir(path))))
-            SubElement(entry_elt, 'dc:title').text = entry
-            class_elt = SubElement(entry_elt, 'upnp:class')
-            if isdir:
-                class_elt.text = 'object.container.storageFolder'
-            else:
-                class_elt.text = 'object.item'
-        return elements, len(all_entries)
-
     def process_soap_action(self, soap_action, soap_request):
         from xml.sax.saxutils import escape
         # we're already looking at the envelope, perhaps I should wrap this with
@@ -367,15 +422,21 @@ class HTTPConnection:
                 s='http://schemas.xmlsoap.org/soap/envelope/',
                 u=soap_action.service_type,
                 action=soap_action.action))
+        in_arguments = {}
+        for child_elt in action_elt.getchildren():
+            assert not child_elt.getchildren()
+            key = child_elt.tag
+            value = child_elt.text
+            assert key not in in_arguments
+            in_arguments[key] = value
         if soap_action.action == 'Browse':
-            result_elements, total_matches = self.browse_result(
-                0, int(action_elt.find('StartingIndex').text),
-                int(action_elt.find('RequestedCount').text))
-            response_body = soap_action_response(soap_action.service_type, soap_action.action, [
-                    ('Result', escape(didl_lite(''.join(
-                        etree.tostring(elt) for elt in result_elements)))),
-                    ('NumberReturned', len(result_elements)),
-                    ('TotalMatches', total_matches),
+            result, total_matches = cd_browse_result(**in_arguments)
+            response_body = soap_action_response(
+                soap_action.service_type,
+                soap_action.action, [
+                    ('Result', escape(didl_lite(''.join(result)))),
+                    ('NumberReturned', len(result)),
+                    ('TotalMatches', total_matches)
                     #('UpdateID', 10)],
                 ]).encode('utf-8')
             self.send(http_response([
@@ -393,7 +454,6 @@ class HTTPConnection:
         if not data:
             logging.debug('HTTP connection with %s closed by peer',
                 self.socket.getpeername())
-            self.socket.close()
             self.closed = True
             return
         logging.debug('%s to %s: %r', self.socket.getpeername(), self.socket.getsockname(), data)
@@ -413,6 +473,10 @@ class HTTPConnection:
                 soap_action = parse_soap_action_header_value(request['soapaction'])
                 self.process_soap_action(soap_action, etree.fromstring(data))
                 return
+        elif request.method in ['SUBSCRIBE']:
+            self.close()
+            return
+        assert False, (request.method, request.path)
         self.close()
 
     def fileno(self):
@@ -451,15 +515,16 @@ class DMS:
 
     def __init__(self):
         logging.basicConfig(stream=sys.stderr, level=0)
-        self.ssdp = SSDP('192.168.24.9', self)
+        self.ssdp = SSDP('', self)
         # there is much more to it than this
         self.device_uuid = 'uuid:deadbeef-0000-0000-0000-0000000b00b5'
-        self.alive_interval = 10
+        self.alive_interval = 895
         self.device_desc = make_device_desc(self.device_uuid)
-        self.ssdp.send_goodbye()
         self.http_server = HTTPServer(self)
         self.http_conns = []
-        self.events = [(0, self.advertise)]
+        self.events = []
+        self.add_event(0, self.ssdp.send_goodbye)
+        self.add_event(1, self.advertise)
         while True:
             r = [self.http_server, self.ssdp.receiver] + self.http_conns
             while True:
