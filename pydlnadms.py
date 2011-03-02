@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
-import collections, heapq, logging, os, pdb, platform, select, socket, struct, \
-    sys, time
+import collections, heapq, http.client, logging, os, pdb, platform, select, socket, struct, \
+    sys, time, urllib.parse
 from xml.etree import ElementTree as etree
 
 def make_xml_service_description(actions, statevars):
@@ -32,6 +32,7 @@ def make_xml_service_description(actions, statevars):
                 SubElement(allowedValueList, 'allowedValue').text = av
     return tostring(scpd).encode('utf-8')
 
+HTTP_BODY_SEPARATOR = b'\r\n' * 2
 EXPIRY_FUDGE = 10
 SSDP_PORT = 1900
 SSDP_MCAST_ADDR = '239.255.255.250'
@@ -112,9 +113,9 @@ class SSDPSender:
         # don't loop back multicast packets to the local sockets
         #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
         # perhaps the local if should be the host?
-        #mreq = struct.pack('II', socket.INADDR_ANY, socket.INADDR_ANY)
-        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
-        #s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
+        mreq = struct.pack('II', socket.INADDR_ANY, socket.INADDR_ANY)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
         s.bind((host, 0))
         self.socket = s
         self.master = master
@@ -129,8 +130,8 @@ class SSDPReceiver:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         s.bind((host, SSDP_PORT))
-        #mreq = struct.pack('4sI', socket.inet_aton(SSDP_MCAST_ADDR), socket.INADDR_ANY)
-        #s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        mreq = struct.pack('4sI', socket.inet_aton(SSDP_MCAST_ADDR), socket.INADDR_ANY)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         self.socket = s
         self.master = master
         self.closed = False
@@ -138,7 +139,13 @@ class SSDPReceiver:
     def fileno(self):
         return self.socket.fileno()
 
-    def on_read_event(self):
+    def need_read(self):
+        return True
+
+    def need_write(self):
+        return False
+
+    def do_read(self):
         data, addr = self.socket.recvfrom(0x1000)
         assert len(data) < 0x1000
         logging.debug('Received SSDP Request from %s: %r', addr, data)
@@ -230,16 +237,6 @@ class SSDP:
         self.send(data, addr)
         logging.debug('Responded to M-SEARCH from %s: %r', addr, data)
 
-class SOAPActionHeader: pass
-
-def parse_soap_action_header_value(value):
-    assert value[0] == '"' and value[-1] == '"', value
-    service_type, action = value[1:-1].rsplit('#', 1)
-    sa = SOAPActionHeader()
-    sa.service_type = service_type
-    sa.action = action
-    return sa
-
 class HTTPRequest:
 
     __slots__ = 'method', 'path', 'protocol', 'headers'
@@ -253,16 +250,17 @@ class HTTPRequest:
     def __getitem__(self, key):
         return self.headers[key.upper()]
 
-    @classmethod
-    def from_bytes(cls, data):
-        request = cls()
-        header_buf, data = data.split(b'\r\n\r\n', 1)
-        lines = header_buf.decode('utf-8').split('\r\n')
-        request.method, request.path, request.protocol = lines[0].split()
-        for h in lines[1:]:
-            name, value = h.split(':', 1)
-            request[name] = value
-        return request, data
+def http_request_from_bytes(data):
+    request = HTTPRequest()
+    header_buf, data = data.split(b'\r\n\r\n', 1)
+    assert not data
+    lines = header_buf.decode('utf-8').split('\r\n')
+    request.method, request.path, request.protocol = lines[0].split()
+    request.path = urllib.parse.unquote(request.path)
+    for h in lines[1:]:
+        name, value = h.split(':', 1)
+        request[name] = value
+    return request
 
 def httpify_headers(headers):
     from itertools import chain
@@ -274,8 +272,9 @@ def http_message(first_line, headers, body):
 def http_request(method, path, headers, body=b''):
     return http_message(' '.join((method, path, 'HTTP/1.1')), headers, body)
 
-def http_response(headers, body=b''):
-    return http_message('HTTP/1.1 200 OK', headers, body)
+def http_response(headers=(), body=b'', code=200, reason=''):
+    status_line = 'HTTP/1.1 {:03d} {}'.format(code, reason or http.client.responses[code])
+    return http_message(status_line, headers, body)
 
 def rfc1123_date():
     return time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
@@ -343,6 +342,8 @@ def didl_lite(content):
 
 #objects = Objects()
 #objects.add_path('/media/data/towatch')
+#<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
+
 
 def cd_object_xml(path, parent_id):
     isdir = os.path.isdir(path)
@@ -358,8 +359,9 @@ def cd_object_xml(path, parent_id):
     else:
         class_elt.text = 'object.item.videoItem'
     res_elt = etree.SubElement(element, 'res',
-            protocolInfo='http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0'
-        ).text = 'http://192.168.24.9/res' + path
+            protocolInfo='http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0',
+            size=str(os.path.getsize(path)),
+        ).text = 'http://192.168.24.9:8200/res' + urllib.parse.quote(path)
     return etree.tostring(element)
 
 def cd_browse_result(**soap_args):
@@ -381,103 +383,198 @@ def cd_browse_result(**soap_args):
     else:
         assert False, soap_args['BrowseFlag']
 
-class HTTPConnection:
+class ResourceRequestHandler:
 
-    def __init__(self, socket, root_device):
-        self.socket = socket
-        self.buffer = b''
-        self.root_device = root_device
-        self.closed = False
+    def __init__(self):
+        pass
+
+class RequestHandler:
+
+    def __init__(self, socket):
+        self.__socket = socket
 
     def send(self, data):
-        sent = self.socket.send(data)
-        assert sent == len(data), (sent, len(data))
+        sent = self.__socket.send(data)
+        logging.debug('Sent %s bytes from %s to %s: %r', sent,
+            self.__socket.getsockname(), self.__socket.getpeername(), data[:sent])
+        return sent
 
-    def send_description(self, desc):
-        data = http_response((
+    def recv(self, count):
+        data = self.__socket.recv(count)
+        logging.debug('Received %s bytes from %s to %s: %r', len(data),
+            self.__socket.getpeername(), self.__socket.getsockname(), data)
+        return data
+
+class SendBufferRequestHandler(RequestHandler):
+
+    def __init__(self, socket, buffer):
+        super().__init__(socket)
+        self.buffer = buffer
+
+    def need_read(self):
+        return False
+
+    def need_write(self):
+        return self.buffer
+
+    def do_write(self):
+        self.buffer = self.buffer[self.send(self.buffer):]
+
+class BrowseRequestHandler(RequestHandler):
+
+    def __init__(self, socket, request, soap_action):
+        super().__init__(socket)
+        #self.request = request
+        self.in_buf = b''
+        self.out_buf = b''
+        self.content_length = int(request['content-length'])
+        self.soap_action = soap_action
+
+    def need_read(self):
+        return len(self.in_buf) != self.content_length
+
+    def need_write(self):
+        return self.out_buf
+
+    def do_read(self):
+        self.in_buf += self.recv(self.content_length - len(self.in_buf))
+        if len(self.in_buf) == self.content_length:
+            # we're already looking at the envelope, perhaps I should wrap this with
+            # a Document so that absolute lookup is done instead? TODO
+            soap_request = etree.fromstring(self.in_buf)
+            action_elt = soap_request.find(
+                '{{{s}}}Body/{{{u}}}{action}'.format(
+                    s='http://schemas.xmlsoap.org/soap/envelope/',
+                    u=self.soap_action.service_type,
+                    action=self.soap_action.action))
+            in_args = {}
+            for child_elt in action_elt.getchildren():
+                assert not child_elt.getchildren()
+                key = child_elt.tag
+                value = child_elt.text
+                assert key not in in_args
+                in_args[key] = value
+            self.handle_soap_request(in_args)
+
+    def do_write(self):
+        self.out_buf = self.out_buf[self.send(self.out_buf):]
+
+    def handle_soap_request(self, soap_args):
+        from xml.sax.saxutils import escape
+        result, total_matches = cd_browse_result(**soap_args)
+        response_body = soap_action_response(
+            self.soap_action.service_type,
+            self.soap_action.action, [
+                ('Result', escape(didl_lite(''.join(result)))),
+                ('NumberReturned', len(result)),
+                ('TotalMatches', total_matches)
+                #('UpdateID', 10)],
+            ]).encode('utf-8')
+        self.out_buf += http_response([
+            ('CONTENT-LENGTH', str(len(response_body))),
+            ('CONTENT-TYPE', 'text/xml; charset="utf-8"'),
+            ('DATE', rfc1123_date()),
+            ('EXT', ''),
+            ('SERVER', SERVER_FIELD)], response_body)
+
+class SoapAction: pass
+
+class HTTPConnection:
+
+    def __init__(self, socket, dms, pollmap):
+        self.socket = socket
+        self.pollmap = pollmap
+        self.peername = socket.getpeername()
+        self.buffer = b''
+        self.dms = dms
+        self.handler = None
+
+    def close(self):
+        logging.debug('HTTP connection from %s to %s was closed',
+            self.socket.getsockname(), self.socket.getpeername())
+        self.socket.close()
+        self.pollmap.remove(self)
+
+    def handler_from_soap_action(self, request):
+        sa_value = request['soapaction']
+        assert sa_value[0] == '"' and sa_value[-1] == '"', sa_value
+        service_type, action = sa_value[1:-1].rsplit('#', 1)
+        soap_action = SoapAction()
+        soap_action.service_type = service_type
+        soap_action.action = action
+        if action == 'Browse':
+            return BrowseRequestHandler(self.socket, request, soap_action)
+        elif action in ['GetSortCapabilities']:
+            self.close()
+        else:
+            assert False, action
+
+    def check_handler(self):
+        if not self.handler.need_read() and not self.handler.need_write():
+            self.handler = None
+
+    def need_read(self):
+        return self.handler is None or self.handler.need_read()
+
+    def need_write(self):
+        return self.handler is not None and self.handler.need_write()
+
+    def do_write(self):
+        self.handler.do_write()
+        self.check_handler()
+
+    def handler_from_description(self, desc):
+        return SendBufferRequestHandler(self.socket, http_response((
                 ('CONTENT-LENGTH', str(len(desc))),
                 ('CONTENT-TYPE', 'text/xml'),
                 ('DATE', rfc1123_date()),
-            ), desc)
-        self.send(data)
-        logging.debug('Sent description %s->%s: %r',
-            self.socket.getsockname(),
-            self.socket.getpeername(),
-            data)
+            ), desc))
 
-    def close(self):
-        peername = self.socket.getpeername()
-        self.socket.close()
-        self.closed = True
-        logging.debug('HTTP connection with %s was closed', peername)
-
-        a = '\n<container id="64" parentID="0" restricted="1" childCount="2"><dc:title>Browse Folders</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="1" parentID="0" restricted="1" childCount="6"><dc:title>Music</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="3" parentID="0" restricted="1" childCount="4"><dc:title>Pictures</dc:title><upnp:class>object.container.storageFolder</upnp:class></container><container id="2" parentID="0" restricted="1" childCount="2"><dc:title>Video</dc:title><upnp:class>object.container.storageFolder</upnp:class></container>'
-
-    def process_soap_action(self, soap_action, soap_request):
-        from xml.sax.saxutils import escape
-        # we're already looking at the envelope, perhaps I should wrap this with
-        # a Document so that absolute lookup is done instead? TODO
-        action_elt = soap_request.find(
-            '{{{s}}}Body/{{{u}}}{action}'.format(
-                s='http://schemas.xmlsoap.org/soap/envelope/',
-                u=soap_action.service_type,
-                action=soap_action.action))
-        in_arguments = {}
-        for child_elt in action_elt.getchildren():
-            assert not child_elt.getchildren()
-            key = child_elt.tag
-            value = child_elt.text
-            assert key not in in_arguments
-            in_arguments[key] = value
-        if soap_action.action == 'Browse':
-            result, total_matches = cd_browse_result(**in_arguments)
-            response_body = soap_action_response(
-                soap_action.service_type,
-                soap_action.action, [
-                    ('Result', escape(didl_lite(''.join(result)))),
-                    ('NumberReturned', len(result)),
-                    ('TotalMatches', total_matches)
-                    #('UpdateID', 10)],
-                ]).encode('utf-8')
-            self.send(http_response([
-                ('CONTENT-LENGTH', str(len(response_body))),
-                ('CONTENT-TYPE', 'text/xml; charset="utf-8"'),
-                ('DATE', rfc1123_date()),
-                ('EXT', ''),
-                ('SERVER', SERVER_FIELD)], response_body))
-            logging.debug('Sent Browse response: %r', response_body)
-        #pdb.set_trace()
-        self.close()
-
-    def on_read_event(self):
-        data = self.socket.recv(0x1000)
-        if not data:
-            logging.debug('HTTP connection with %s closed by peer',
-                self.socket.getpeername())
-            self.closed = True
-            return
-        logging.debug('%s to %s: %r', self.socket.getpeername(), self.socket.getsockname(), data)
-        self.buffer += data
-        request, data = HTTPRequest.from_bytes(data)
-        assert not len(data) or len(data) == int(request['content-length'])
+    def make_handler(self, request):
         if request.method in ['GET', 'HEAD']:
             if request.path == ROOT_DESC_PATH:
-                self.send_description(self.root_device.device_desc)
-                return
+                return self.handler_from_description(
+                    self.dms.device_desc + HTTP_BODY_SEPARATOR)
             for service in SERVICE_LIST:
                 if request.path == service.SCPDURL:
-                    self.send_description(service.xmlDescription)
-                    return
+                    return self.handler_from_description(
+                        service.xmlDescription + HTTP_BODY_SEPARATOR)
+            if request.path.startswith('/res'):
+                path = request.path[len('/res'):]
+                return ResourceRequestHandler(path)
         elif request.method in ['POST']:
             if request.path in (service.controlURL for service in SERVICE_LIST):
-                soap_action = parse_soap_action_header_value(request['soapaction'])
-                self.process_soap_action(soap_action, etree.fromstring(data))
-                return
+                return self.handler_from_soap_action(request)
         elif request.method in ['SUBSCRIBE']:
-            self.close()
-            return
+            return SendBufferRequestHandler(self.socket, http_response(code=501))
         assert False, (request.method, request.path)
-        self.close()
+
+    def do_read(self):
+        if self.handler is None:
+            peek_data = self.socket.recv(0x1000, socket.MSG_PEEK)
+            index = (self.buffer + peek_data).find(HTTP_BODY_SEPARATOR)
+            assert index >= -1
+            if index == -1:
+                bufsize = len(peek_data)
+            else:
+                bufsize = index - len(self.buffer) + len(HTTP_BODY_SEPARATOR)
+            assert bufsize <= len(peek_data), (bufsize, len(peek_data))
+            data = self.socket.recv(bufsize)
+            assert data == peek_data[:bufsize]
+            if data:
+                self.buffer += data
+                del data
+                if index != -1:
+                    logging.debug('Processing completed HTTP request: %r', self.buffer)
+                    request = http_request_from_bytes(self.buffer)
+                    self.buffer = b''
+                    self.handler = self.make_handler(request)
+            else:
+                assert not self.buffer, self.buffer
+                self.close()
+        else:
+            self.handler.do_read()
+            self.check_handler()
 
     def fileno(self):
         return self.socket.fileno()
@@ -503,10 +600,16 @@ class HTTPServer:
         self.master = master
         self.closed = False
 
+    def need_read(self):
+        return True
+
+    def need_write(self):
+        return False
+
     def fileno(self):
         return self.socket.fileno()
 
-    def on_read_event(self):
+    def do_read(self):
         sock, addr = self.socket.accept()
         logging.debug('Accepted connection from %s', addr)
         self.master.on_server_accept(sock)
@@ -526,7 +629,7 @@ class DMS:
         self.add_event(0, self.ssdp.send_goodbye)
         self.add_event(1, self.advertise)
         while True:
-            r = [self.http_server, self.ssdp.receiver] + self.http_conns
+            channels = [self.http_server, self.ssdp.receiver] + self.http_conns
             while True:
                 if self.events:
                     timeout = self.events[0][0] - time.time()
@@ -537,15 +640,21 @@ class DMS:
                     timeout = None
                     break
                 del timeout
+            r = [c for c in channels if c.need_read()]
+            w = [c for c in channels if c.need_write()]
+            for c in channels:
+                if c not in r and c not in w:
+                    self.http_conns.remove(c)
             logging.debug('Polling with timeout: %s', timeout)
-            r, w, x = select.select(r, [], [], timeout)
-            assert not w and not x
-            if not r:
+            r, w, x = select.select(r, w, r + w, timeout)
+            assert not x, x
+            if not any([r, w, x]):
+                # why should this happen? signal?
                 logging.debug('Select returned no events')
             for channel in r:
-                channel.on_read_event()
-                if channel.closed:
-                    self.http_conns.remove(channel)
+                channel.do_read()
+            for channel in w:
+                channel.do_write()
 
     def add_event(self, delay, callback):
         heapq.heappush(self.events, (time.time() + delay, callback))
@@ -555,7 +664,7 @@ class DMS:
         self.add_event(self.alive_interval, self.advertise)
 
     def on_server_accept(self, sock):
-        self.http_conns.append(HTTPConnection(sock, self))
+        self.http_conns.append(HTTPConnection(sock, self, self.http_conns))
 
     @property
     def all_targets(self):
