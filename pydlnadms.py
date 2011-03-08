@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
-import collections, functools, heapq, http.client, logging, mimetypes
+import logging
+logger = logging.getLogger('pydlnadms')
+import collections, errno, functools, heapq, http.client, mimetypes
 import os, pdb, platform
 import select, socket, struct, sys, time, urllib.parse
 from xml.etree import ElementTree as etree
@@ -51,28 +53,28 @@ CONTENT_DIRECTORY_CONTROL_URL = '/ctl/ContentDirectory'
 Service = collections.namedtuple(
     'Service',
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
-CONTENT_DIRECTORY_ROOT = os.path.normpath('/media/data/towatch')
 RESOURCE_PATH = '/res'
 
 SERVICE_LIST = []
 for service, domain, version, actions, statevars in [
-        ('ContentDirectory', None, 1, [
-            ('Browse', [
-                ('ObjectID', 'in', 'A_ARG_TYPE_ObjectID'),
-                ('BrowseFlag', 'in', 'A_ARG_TYPE_BrowseFlag'),
-                ('StartingIndex', 'in', 'A_ARG_TYPE_Index'),
-                ('RequestedCount', 'in', 'A_ARG_TYPE_Count'),
-                ('Result', 'out', 'A_ARG_TYPE_Result'),
-                ('NumberReturned', 'out', 'A_ARG_TYPE_Count'),
-                ('TotalMatches', 'out', 'A_ARG_TYPE_Count')])], [
-            ('A_ARG_TYPE_ObjectID', 'string'),
-            ('A_ARG_TYPE_Result', 'string'),
-            ('A_ARG_TYPE_BrowseFlag', 'string', [
-                'BrowseMetadata', 'BrowseDirectChildren']),
-            ('A_ARG_TYPE_Index', 'ui4'),
-            ('A_ARG_TYPE_Count', 'ui4')]),
-        ('ConnectionManager', None, 1, (), ()),
-        ('X_MS_MediaReceiverRegistrar', 'microsoft.com', 1, (), ()),]:
+            ('ContentDirectory', None, 1, [
+                ('Browse', [
+                    ('ObjectID', 'in', 'A_ARG_TYPE_ObjectID'),
+                    ('BrowseFlag', 'in', 'A_ARG_TYPE_BrowseFlag'),
+                    ('StartingIndex', 'in', 'A_ARG_TYPE_Index'),
+                    ('RequestedCount', 'in', 'A_ARG_TYPE_Count'),
+                    ('Result', 'out', 'A_ARG_TYPE_Result'),
+                    ('NumberReturned', 'out', 'A_ARG_TYPE_Count'),
+                    ('TotalMatches', 'out', 'A_ARG_TYPE_Count')])], [
+                ('A_ARG_TYPE_ObjectID', 'string'),
+                ('A_ARG_TYPE_Result', 'string'),
+                ('A_ARG_TYPE_BrowseFlag', 'string', [
+                    'BrowseMetadata', 'BrowseDirectChildren']),
+                ('A_ARG_TYPE_Index', 'ui4'),
+                ('A_ARG_TYPE_Count', 'ui4')]),
+            ('ConnectionManager', None, 1, (), ()),
+            #('X_MS_MediaReceiverRegistrar', 'microsoft.com', 1, (), ()),
+        ]:
     SERVICE_LIST.append(Service(
         serviceType='urn:{}:service:{}:{}'.format(
             'schemas-upnp-org' if domain is None else domain,
@@ -108,14 +110,19 @@ def make_device_desc(udn):
 
 class SocketWrapper:
 
-    def __init__(self, socket):
-        self.__socket = socket
+    def __init__(self, socket_):
+        self.__socket = socket_
         self.__closed = False
 
+    def getsockname(self):
+        return self.__socket.getsockname()
+
     def send(self, data):
+        sockname = self.__socket.getsockname()
+        peername = self.__socket.getpeername()
         sent = self.__socket.send(data)
-        fmt = 'Sent %s bytes from %s to %s'
-        args = [sent, self.__socket.getsockname(), self.__socket.getpeername()]
+        fmt = 'Sent %s bytes on %s to %s'
+        args = [sent, sockname, peername]
         if sent <= 24 * 80:
             fmt += ': %r'
             args += [data[:sent]]
@@ -143,56 +150,44 @@ class SocketWrapper:
 
     def close(self):
         assert not self.__closed
-        sockname = self.__socket.getsockname()
-        peername = self.__socket.getpeername()
         self.__socket.close()
-        logging.debug('Closed socket: %s', (sockname, peername))
+        logging.debug('Closed socket: %s', self)
         self.__closed = True
-
-    def getsockname(self):
-        return self.__socket.getsockname()
-
-    def getpeername(self):
-        return self.__socket.getpeername()
-
-    #def __getattr__(self, name):
-    #    return getattr(self.__socket, name)
 
 
 class SSDPSender(SocketWrapper):
 
-    def __init__(self, host, master):
+    def __init__(self, hosts, master):
         #for if_addr in if_addrs:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # don't loop back multicast packets to the local sockets
-        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
         # perhaps the local if should be the host?
-        mreq = struct.pack('II', socket.INADDR_ANY, socket.INADDR_ANY)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
+        #print('mcast_if', host)
+        #mreq = struct.pack('4s4s',
+        #    socket.inet_aton(SSDP_MCAST_ADDR),
+        #    socket.inet_aton(host))
+        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 10)
-        s.bind((host, 0))
+        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 10)
+        #s.bind(('', 0))
         super().__init__(s)
         self.master = master
 
-    def fileno(self):
-        return self.socket.fileno()
 
-
-class SSDPReceiver:
+class SSDPReceiver(SocketWrapper):
 
     def __init__(self, hosts, master):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
-        s.bind((hosts[0], SSDP_PORT))
-        mreq = struct.pack('4sI', socket.inet_aton(SSDP_MCAST_ADDR),
-            socket.INADDR_ANY)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        self.socket = s
+        s.bind(('', SSDP_PORT))
+        for host in hosts:
+            mreq = struct.pack('4s4s',
+                socket.inet_aton(SSDP_MCAST_ADDR),
+                socket.inet_aton('0.0.0.0'))
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        super().__init__(s)
         self.master = master
-
-    def fileno(self):
-        return self.socket.fileno()
 
     def need_read(self):
         return True
@@ -201,19 +196,21 @@ class SSDPReceiver:
         return False
 
     def do_read(self):
-        data, addr = self.socket.recvfrom(0x1000)
+        data, addr = self.recvfrom(0x1000)
         assert len(data) < 0x1000
         logging.debug('Received SSDP Request from %s: %r', addr, data)
-        self.master.process_request(data, addr)
+        self.master.process_request(data, addr, self.getsockname())
+
 
 class SSDP:
 
+    logger = logging.getLogger('ssdp')
+
     def __init__(self, hosts, dms):
-        self.senders = []
-        for host in hosts:
-            self.senders.append(SSDPSender(host, self))
+        self.sender = SSDPSender(hosts, self)
         self.receiver = SSDPReceiver(hosts, self)
         self.dms = dms
+        self.ifaddrs = hosts or ('0.0.0.0',)
 
     @property
     def all_targets(self):
@@ -225,35 +222,37 @@ class SSDP:
 
     def send_goodbye(self):
         for nt in self.dms.all_targets:
-            for sender in self.senders:
+            for ifaddr in self.ifaddrs:
                 buf = http_request('NOTIFY', '*', (
                     ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
                     ('NT', nt),
                     ('USN', self.dms.usn_from_target(nt)),
                     ('NTS', 'ssdp:byebye'),))
-                sender.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
-                logging.debug('SSDP multicasted ssdp:byebye from %s: %r',
-                    sender.getsockname(), buf)
+                self.sender.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
+                self.logger.debug('SSDP multicasted ssdp:byebye from %s',
+                    self.sender.getsockname())
 
     def send_notify(self):
         # TODO for each interface
         # sends should also be delayed 100ms by eventing
         for nt in self.all_targets:
-            for sender in self.senders:
+            for ifaddr in self.ifaddrs:
                 buf = http_request('NOTIFY', '*', (
                     ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
                     ('CACHE-CONTROL', 'max-age={:d}'.format(
                         self.dms.notify_interval * 2 + EXPIRY_FUDGE)),
-                    ('LOCATION', 'http://{0[0]}:{0[1]:d}{1}'.format(
-                        self.http_address, ROOT_DESC_PATH)),
+                    ('LOCATION', 'http://{}:{:d}{}'.format(
+                        ifaddr,
+                        self.http_address[1],
+                        ROOT_DESC_PATH)),
                     ('NT', nt),
                     ('NTS', 'ssdp:alive'),
                     ('SERVER', SERVER_FIELD),
                     ('USN', self.usn_from_target(nt))))
-                sender.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
-                logging.debug('Sent ssdp:alive: %r', buf)
+                self.sender.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
+                self.logger.debug('Sent ssdp:alive: %r', buf)
 
-    def process_request(self, data, addr):
+    def process_request(self, data, peername, sockname):
         request = http_request_from_bytes(data)
         if request.method != 'M-SEARCH':
             return
@@ -265,6 +264,7 @@ class SSDP:
         else:
             logging.debug('Ignoring M-SEARCH for %r', st)
             return
+        #for sender
         for st in sts:
             self.send_msearch_reply(addr, st)
 
@@ -368,7 +368,7 @@ def didl_lite(content):
 #objects.add_path('/media/data/towatch')
 #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
-def cd_object_xml(path, parent_id):
+def cd_object_xml(path, location, parent_id):
     isdir = os.path.isdir(path)
     element = etree.Element(
         'container' if isdir else 'item',
@@ -385,28 +385,28 @@ def cd_object_xml(path, parent_id):
         protocolInfo='http-get:*:{}:DLNA.ORG_OP=01;DLNA.ORG_CI=0'.format(
             mimetypes.guess_type(path)[0]),)
     # TODO fix this absolute address
-    res_elt.text = LOCATION + RESOURCE_PATH + urllib.parse.quote(path)
+    res_elt.text = location + RESOURCE_PATH + urllib.parse.quote(path)
     if not isdir:
         res_elt.set('size', str(os.path.getsize(path)))
     return etree.tostring(element)
 
-def path_to_object_id(path):
+def path_to_object_id(root_path, path):
     # TODO prevent escaping root directory
     path = os.path.normpath(path)
-    if path == CONTENT_DIRECTORY_ROOT:
+    if path == root_path:
         return '0'
     else:
         return path
 
-def object_id_to_path(object_id):
+def object_id_to_path(root_path, object_id):
     if object_id == '0':
-        return CONTENT_DIRECTORY_ROOT
+        return root_path
     else:
         return object_id
 
-def cd_browse_result(**soap_args):
+def cd_browse_result(root_path, location, **soap_args):
     """(list of CD objects in XML, total possible elements)"""
-    path = object_id_to_path(soap_args['ObjectID'])
+    path = object_id_to_path(root_path, soap_args['ObjectID'])
     if soap_args['BrowseFlag'] == 'BrowseDirectChildren':
         entries = os.listdir(path)
         start = int(soap_args['StartingIndex'])
@@ -416,6 +416,7 @@ def cd_browse_result(**soap_args):
         for entry in entries[start:end]:
             elements.append(cd_object_xml(
                 os.path.join(path, entry),
+                location,
                 soap_args['ObjectID']))
         return elements, len(entries)
     else:
@@ -425,7 +426,7 @@ def cd_browse_result(**soap_args):
 
 class ResourceRequestHandler:
 
-    def __init__(self, *, socket, request, done):
+    def __init__(self, *, socket, request, on_done, context):
         #pdb.set_trace()
         units, range = request['range'].split('=', 1)
         assert units == 'bytes'
@@ -433,24 +434,34 @@ class ResourceRequestHandler:
         self.start = int(start) if start else 0
         self.end = int(end) if end else None
         del start, end, units, range
-        path = request.path[len(RESOURCE_PATH):]
-        self.file = open(path, 'r+b')
+        self.path = request.path[len(RESOURCE_PATH):]
+        if self.end is None:
+            self.end = os.path.getsize(self.path)
+        self.file = open(self.path, 'r+b')
         self.file.seek(self.start)
-        self.done = done
+        self.on_done = on_done
         self.socket = socket
         headers = [
             ('Server', SERVER_FIELD),
             ('Date', rfc1123_date()),
             ('Ext', ''),
             ('transferMode.dlna.org', 'Streaming'),
-            ('Content-Type', mimetypes.guess_type(path)[0]),
-            ('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_CI=0')]
+            ('Content-Type', mimetypes.guess_type(self.path)[0]),
+            ('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_CI=0'),
+            ('Content-Range', 'bytes={:d}-{:d}'.format(self.start, self.end)),
+            ('realTimeInfo.dlna.org', 'DLNA.ORG_TLAG=*'),
+            ('Accept-Ranges', 'bytes'),]
         if self.end is not None:
-            headers.append(('CONTENT-LENGTH', str(self.end - self.start)))
-        self.buffer = http_response(headers)
+            headers.append(('Content-Length', str(self.end - self.start)))
+        self.buffer = http_response(headers, code=206)
+
+    def __repr__(self):
+        return '<{} path={}, range={}-{}, len(buffer)={}>'.format(
+            self.__class__.__name__,
+            self.path, self.start, self.end, len(self.buffer))
 
     def need_read(self):
-        return True
+        return False
 
     def need_write(self):
         return self.buffer or self.file.tell() != self.end
@@ -458,26 +469,24 @@ class ResourceRequestHandler:
     def do_write(self):
         #pdb.set_trace()
         if not self.buffer:
-            if self.end is None:
-                bufsize = 0x20000
-            else:
-                bufsize = self.end - self.file.tell()
+            bufsize = 0x20000 # 128K
+            if self.end is not None:
+                bufsize = min(bufsize, self.end - self.file.tell())
             self.buffer += self.file.read(bufsize)
             if not self.buffer:
-                self.done()
-        try:
-            self.buffer = self.buffer[self.socket.send(self.buffer):]
-        except socket.error as exc:
-            if exc.errno == errno.EPIPE:
-                self.done(die=True)
+                self.on_done()
+                return
+        self.buffer = self.buffer[self.socket.send(self.buffer):]
+        if not self.need_write():
+            self.on_done()
 
 
 class SendBufferRequestHandler:
 
-    def __init__(self, buffer, *, socket, request, done):
+    def __init__(self, buffer, *, socket, request, on_done, context):
         self.socket = socket
         self.buffer = buffer
-        self.done = done
+        self.done = on_done
 
     def need_read(self):
         return False
@@ -493,7 +502,7 @@ class SendBufferRequestHandler:
 
 class SoapRequestHandler:
 
-    def __init__(self, *, socket, request, done):
+    def __init__(self, *, socket, request, on_done, context):
         sa_value = request['soapaction']
         assert sa_value[0] == '"' and sa_value[-1] == '"', sa_value
         self.service_type, self.action = sa_value[1:-1].rsplit('#', 1)
@@ -501,7 +510,9 @@ class SoapRequestHandler:
         self.in_buf = b''
         self.out_buf = b''
         self.socket = socket
-        self.done = done
+        self.on_done = on_done
+        self.context = context
+        self.request = request
 
     def need_read(self):
         return len(self.in_buf) != self.content_length
@@ -546,11 +557,14 @@ class SoapRequestHandler:
         self.out_buf = self.out_buf[self.socket.send(self.out_buf):]
         if not self.out_buf:
             assert len(self.in_buf) == self.content_length
-            self.done()
+            self.on_done()
 
     def soap_Browse(self, **soap_args):
         from xml.sax.saxutils import escape
-        result, total_matches = cd_browse_result(**soap_args)
+        result, total_matches = cd_browse_result(
+            self.context.path,
+            'http://' + self.request['host'],
+            **soap_args)
         return dict(
                 Result=escape(didl_lite(''.join(result))),
                 NumberReturned=len(result),
@@ -565,6 +579,8 @@ class SoapAction: pass
 
 class HTTPConnection:
 
+    logger = logging.getLogger('httpconn')
+
     def __init__(self, socket, dms, pollmap):
         self.pollmap = pollmap
         self.buffer = b''
@@ -575,6 +591,7 @@ class HTTPConnection:
     def close(self):
         self._socket.close()
         self.pollmap.remove(self)
+        self.handler = None
 
     def recv(self, *args, **kwargs):
         return self._socket.recv(*args, **kwargs)
@@ -592,7 +609,14 @@ class HTTPConnection:
         return self.handler is not None and self.handler.need_write()
 
     def do_write(self):
-        self.handler.do_write()
+        try:
+            self.handler.do_write()
+        except socket.error as exc:
+            if exc.errno in [errno.EPIPE, errno.ENOTCONN]:
+                self.logger.debug('Socket was closed on us')
+                self.close()
+            else:
+                raise
 
     def handler_done(self, die=False):
         self.handler = None
@@ -605,7 +629,7 @@ class HTTPConnection:
         if self.handler is None:
             peek_data = self.recv(0x1000, socket.MSG_PEEK)
             index = (self.buffer + peek_data).find(HTTP_BODY_SEPARATOR)
-            assert index >= -1
+            assert index >= -1, index
             if index == -1:
                 bufsize = len(peek_data)
             else:
@@ -617,17 +641,19 @@ class HTTPConnection:
                 self.buffer += data
                 del data
                 if index != -1:
-                    logging.debug('Processing completed HTTP request: %r', self.buffer)
+                    logging.debug('Complete HTTP request arrived: %r', self.buffer)
                     request = http_request_from_bytes(self.buffer)
                     self.buffer = b''
                     factory = self.handler_factory_new(request)
                     if factory is None:
                         self.close()
                     else:
+                        assert self.handler is None, self.handler
                         self.handler = factory(
                             socket=self,
                             request=request,
-                            done=self.handler_done)
+                            on_done=self.handler_done,
+                            context=self.dms)
                         self.request = request
             else:
                 assert not self.buffer, self.buffer
@@ -636,6 +662,7 @@ class HTTPConnection:
             self.handler.do_read()
 
     def handler_factory_new(self, request):
+        '''Returns None if the request cannot be handled. Otherwise returns a callable that takes socket, request and done callback named arguments to handle the request.'''
         def send_buffer(buf):
             return functools.partial(SendBufferRequestHandler, buf)
         def soap_action():
@@ -667,6 +694,11 @@ class HTTPConnection:
             return None
         assert False, (request.method, request.path)
 
+    def __str__(self):
+        return '<{} handler={}, buffer={!r}>'.format(
+            self.__class__.__name__,
+            self.handler,
+            self.buffer,)
 
 class HTTPServer:
 
@@ -705,7 +737,7 @@ class HTTPServer:
 
 class DMS:
 
-    def __init__(self, hosts, port):
+    def __init__(self, hosts, port, path):
         self.ssdp = SSDP(hosts, self)
         # there is much more to it than this
         self.device_uuid = 'uuid:deadbeef-0000-0000-0000-0000000b00b5'
@@ -714,10 +746,11 @@ class DMS:
         self.http_server = HTTPServer(port, self)
         self.http_conns = []
         self.events = []
+        self.path = path
         self.add_event(0, self.ssdp.send_goodbye)
         self.add_event(1, self.advertise)
         while True:
-            channels = [self.http_server, self.ssdp.receiver] + self.http_conns
+            channels = [self.http_server] + [self.ssdp.receiver] + self.http_conns
             while True:
                 if self.events:
                     timeout = self.events[0][0] - time.time()
@@ -739,9 +772,15 @@ class DMS:
             if not any([r, w, x]):
                 # why should this happen? signal?
                 logging.debug('Select returned no events')
+            else:
+                for channel in r:
+                    logging.debug('Read event occurred: %s', channel)
+                for channel in w:
+                    logging.debug('Write event occurred: %s', channel)
             for channel in r:
                 channel.do_read()
             for channel in w:
+                #pdb.set_trace()
                 channel.do_write()
 
     def add_event(self, delay, callback):
@@ -752,6 +791,7 @@ class DMS:
         self.add_event(self.notify_interval, self.advertise)
 
     def on_server_accept(self, sock):
+        sock.setblocking(False)
         self.http_conns.append(HTTPConnection(
             SocketWrapper(sock), self, self.http_conns))
 
@@ -773,14 +813,16 @@ def main():
     logging.basicConfig(stream=sys.stderr, level=0)
     from optparse import OptionParser
     parser = OptionParser()
-    parser.add_option('-a', '--attach', action='append',
-        help='listen on ADDRESS')
+    parser.add_option('-a', '--address', action='append', #default=['0.0.0.0'],
+        help='notify from ADDRESS')
     #parser.add_option('-i', '--interface', action='append',
     #    help='listen on INTERFACE')
     parser.add_option('-p', '--port', type='int', default=1337,
         help='media server listen PORT')
     opts, args = parser.parse_args()
-    DMS(opts.attach, opts.port)
+    print(opts, args)
+    assert len(args) == 1, args
+    DMS(opts.address, opts.port, os.path.normpath(args[0]))
 
 if __name__ == '__main__':
     main()
