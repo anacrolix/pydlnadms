@@ -54,6 +54,8 @@ Service = collections.namedtuple(
     'Service',
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
 RESOURCE_PATH = '/res'
+# flags are in hex. trailing 24 zeroes, 26 are after the space
+CONTENT_FEATURES = 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
 
 SERVICE_LIST = []
 for service, domain, version, actions, statevars in [
@@ -120,6 +122,7 @@ class SocketWrapper:
                 self.peername = None
             else:
                 raise
+        self.sockname = self.__socket.getsockname()
 
     def getsockname(self):
         return self.__socket.getsockname()
@@ -152,6 +155,9 @@ class SocketWrapper:
             data)
         return data
 
+    def recvfrom(self, *args, **kwds):
+        return self.__socket.recvfrom(*args, **kwds)
+
     def fileno(self):
         return self.__socket.fileno()
 
@@ -160,6 +166,11 @@ class SocketWrapper:
         self.__socket.close()
         logging.debug('Closed socket: %s', self)
         self.__closed = True
+
+    def __repr__(self):
+        return '<SocketWrapper sock={} peer={}>'.format(
+            self.sockname,
+            self.peername,)
 
 
 class SSDPSender(SocketWrapper):
@@ -341,7 +352,7 @@ def http_request(method, path, headers, body=b''):
 
 def http_response(headers=(), body=b'', code=200, reason=''):
     status_line = 'HTTP/1.1 {:03d} {}'.format(code, reason or http.client.responses[code])
-    return http_message(status_line, headers, body)
+    return http_message(status_line, list(headers) + [('Connection', 'close')], body)
 
 def rfc1123_date():
     return time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
@@ -376,6 +387,7 @@ def didl_lite(content):
 #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
 def cd_object_xml(path, location, parent_id):
+    '''Returns a DIDL response object XML snippet'''
     isdir = os.path.isdir(path)
     element = etree.Element(
         'container' if isdir else 'item',
@@ -389,12 +401,16 @@ def cd_object_xml(path, location, parent_id):
     else:
         class_elt.text = 'object.item.videoItem'
     res_elt = etree.SubElement(element, 'res',
-        protocolInfo='http-get:*:{}:DLNA.ORG_OP=01'.format(#;DLNA.ORG_CI=0'.format(
-            mimetypes.guess_type(path)[0]),)
+        protocolInfo='http-get:*:{}:{}'.format(
+            mimetypes.guess_type(path)[0],
+            CONTENT_FEATURES))
     # TODO fix this absolute address
     res_elt.text = location + RESOURCE_PATH + urllib.parse.quote(path)
     if not isdir:
         res_elt.set('size', str(os.path.getsize(path)))
+        from metadata_ff import res_data
+        for attr, value in res_data(path).items():
+            res_elt.set(attr, str(value))
     return etree.tostring(element)
 
 def path_to_object_id(root_path, path):
@@ -415,7 +431,7 @@ def cd_browse_result(root_path, location, **soap_args):
     """(list of CD objects in XML, total possible elements)"""
     path = object_id_to_path(root_path, soap_args['ObjectID'])
     if soap_args['BrowseFlag'] == 'BrowseDirectChildren':
-        entries = os.listdir(path)
+        entries = sorted(os.listdir(path))
         start = int(soap_args['StartingIndex'])
         count = int(soap_args['RequestedCount'])
         end = start + count if count else None
@@ -435,15 +451,20 @@ class ResourceRequestHandler:
 
     def __init__(self, *, socket, request, context):
         units, range = request['range'].split('=', 1)
-        assert units == 'bytes'
+        assert units == 'bytes', units
         start, end = range.split('-', 1)
         self.start = int(start) if start else 0
-        self.end = int(end) if end else None
+        self.end = int(end) + 1 if end else None
         del start, end, units, range
         self.path = request.path[len(RESOURCE_PATH):]
         self.file = open(self.path, 'r+b')
-        if self.end is not None:
-            self.end = min(self.end, os.fstat(self.file.fileno()).st_size)
+        size = os.fstat(self.file.fileno()).st_size
+        if self.end is None:
+            # TODO: do we have to determine the end of the stream?
+            self.end = size
+            #pass
+        else:
+            self.end = min(self.end, size)
         self.file.seek(self.start)
         self.socket = socket
         headers = [
@@ -452,11 +473,14 @@ class ResourceRequestHandler:
             ('Ext', ''),
             ('transferMode.dlna.org', 'Streaming'),
             ('Content-Type', mimetypes.guess_type(self.path)[0]),
-            ('contentFeatures.dlna.org', 'DLNA.ORG_OP=01'),#;DLNA.ORG_CI=0'),
-            ('Content-Range', 'bytes={:d}-{}'.format(
+            # the resource is byte-seekable only and not transcoded
+            ('contentFeatures.dlna.org', CONTENT_FEATURES),
+            ('Content-Range', 'bytes {:d}-{}/{:d}'.format(
                 self.start,
-                '' if self.end is None else self.end)),
-            #('realTimeInfo.dlna.org', 'DLNA.ORG_TLAG=*'),
+                '' if self.end is None else self.end - 1,
+                size)),
+            # TODO: wtf does this mean?
+            ('realTimeInfo.dlna.org', 'DLNA.ORG_TLAG=*'),
             ('Accept-Ranges', 'bytes'),]
         if self.end is None:
             headers.append(('Connection', 'close'))
@@ -472,7 +496,7 @@ class ResourceRequestHandler:
             len(self.buffer))
 
     def on_done(self):
-        if self.end is None or self.file.tell() != self.end:
+        if self.end is None or self.file.tell() != self.end or self.buffer:
             self.socket.close()
 
     def need_read(self):
@@ -483,7 +507,7 @@ class ResourceRequestHandler:
 
     def do_write(self):
         if not self.buffer:
-            bufsize = 0x20000 # 128K
+            bufsize = 0x80000 # 512K
             if self.end is not None:
                 bufsize = min(bufsize, self.end - self.file.tell())
             self.buffer = self.file.read(bufsize)
@@ -499,6 +523,9 @@ class SendBufferRequestHandler:
     def __init__(self, buffer, *, socket, request, context):
         self.socket = socket
         self.buffer = buffer
+
+    def on_done(self):
+        return len(self.buffer) == 0
 
     def need_read(self):
         return False
@@ -523,6 +550,10 @@ class SoapRequestHandler:
         self.socket = socket
         self.context = context
         self.request = request
+
+    def on_done(self):
+        if self.need_read() or self.need_write():
+            self.socket.close()
 
     def need_read(self):
         return len(self.in_buf) != self.content_length
@@ -567,7 +598,7 @@ class SoapRequestHandler:
 
     def do_write(self):
         self.out_buf = self.out_buf[self.socket.send(self.out_buf):]
-        return self.out_buf
+        return len(self.out_buf) != 0
 
     def soap_Browse(self, **soap_args):
         from xml.sax.saxutils import escape
@@ -629,11 +660,13 @@ class HTTPConnection:
                 return
         self.handler_done()
 
-    def handler_done(self, die=False):
+    def handler_done(self):
+        #self.handler.on_done()
         self.handler = None
-        if die or 'connection' in self.request and \
+        if 'connection' in self.request and \
                 self.request['connection'].lower() == 'close':
-            self.close()
+            pass
+        self.close()
         self.request = None
 
     def do_read(self):
@@ -669,7 +702,8 @@ class HTTPConnection:
                 assert not self.buffer, self.buffer
                 self.close()
         else:
-            self.handler.do_read()
+            if not self.handler.do_read():
+                self.handler_done()
 
     def handler_factory_new(self, request):
         '''Returns None if the request cannot be handled. Otherwise returns a callable that takes socket, request and done callback named arguments to handle the request.'''
@@ -791,6 +825,7 @@ class DMS:
             for channel in r:
                 channel.do_read()
             for channel in w:
+                #if channel in self.http_conns:
                 #pdb.set_trace()
                 channel.do_write()
 
