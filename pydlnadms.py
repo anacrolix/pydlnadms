@@ -147,16 +147,22 @@ class SocketWrapper:
 
     def recv(self, bufsize, flags=0):
         data = self.__socket.recv(bufsize, flags)
-        logging.debug('%r %s %s bytes from %s: %r',
-            self.__socket.getsockname(),
-            'peeked at' if flags & socket.MSG_PEEK else 'received',
-            len(data),
-            self.peername,
-            data)
+        from socket import MSG_PEEK
+        if flags & MSG_PEEK:
+            logging.debug('Peeked at %s bytes', len(data))
+        else:
+            logging.debug('Received %s bytes on %s%s: %r',
+                len(data),
+                self.__socket.getsockname(),
+                self.peername,
+                data)
         return data
 
     def recvfrom(self, *args, **kwds):
-        return self.__socket.recvfrom(*args, **kwds)
+        buf, addr = self.__socket.recvfrom(*args, **kwds)
+        logging.debug('Received %s bytes on %s%s: %r',
+            len(buf), self.sockname, addr, buf)
+        return buf, addr
 
     def fileno(self):
         return self.__socket.fileno()
@@ -173,37 +179,12 @@ class SocketWrapper:
             self.peername,)
 
 
-class SSDPSender(SocketWrapper):
-
-    def __init__(self, hosts, master):
-        #for if_addr in if_addrs:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # don't loop back multicast packets to the local sockets
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
-        # perhaps the local if should be the host?
-        #print('mcast_if', host)
-        #mreq = struct.pack('4s4s',
-        #    socket.inet_aton(SSDP_MCAST_ADDR),
-        #    socket.inet_aton(host))
-        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreq)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
-        #s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 10)
-        #s.bind(('', 0))
-        super().__init__(s)
-        self.master = master
-
-
 class SSDPReceiver(SocketWrapper):
 
-    def __init__(self, hosts, master):
+    def __init__(self, master):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         s.bind(('', SSDP_PORT))
-        for host in hosts:
-            mreq = struct.pack('4s4s',
-                socket.inet_aton(SSDP_MCAST_ADDR),
-                socket.inet_aton('0.0.0.0'))
-            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         super().__init__(s)
         self.master = master
 
@@ -214,9 +195,9 @@ class SSDPReceiver(SocketWrapper):
         return False
 
     def do_read(self):
+        # MTU should limit UDP packet sizes to well below this
         data, addr = self.recvfrom(0x1000)
-        assert len(data) < 0x1000
-        logging.debug('Received SSDP Request from %s: %r', addr, data)
+        assert len(data) < 0x1000, len(addr)
         self.master.process_request(data, addr, self.getsockname())
 
 
@@ -224,67 +205,71 @@ class SSDP:
 
     logger = logging.getLogger('ssdp')
 
-    def __init__(self, hosts, dms):
-        self.sender = SSDPSender(hosts, self)
-        self.receiver = SSDPReceiver(hosts, self)
+    def __init__(self, dms):
+        self.receiver = SSDPReceiver(self)
         self.dms = dms
-        self.ifaddrs = hosts or ('0.0.0.0',)
 
     @property
-    def all_targets(self):
-        return self.dms.all_targets
+    def notify_interfaces(self):
+        from getifaddrs import getifaddrs, IFF_LOOPBACK
+        from socket import AF_INET
+        for ifaddr in getifaddrs():
+            if ifaddr.family == AF_INET and not ifaddr.flags & IFF_LOOPBACK:
+                yield ifaddr.family, ifaddr.addr
 
-    @property
-    def notify_interval(self):
-        return self.dms.notify_interval
+    def ssdp_multicast(self, family, addr, buf):
+        from socket import socket, SOCK_DGRAM, IPPROTO_IP, IP_MULTICAST_LOOP
+        s = socket(family, SOCK_DGRAM)
+        s.setsockopt(IPPROTO_IP, IP_MULTICAST_LOOP, False)
+        s.bind((addr[0], 0))
+        s = SocketWrapper(s)
+        s.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
 
     def send_goodbye(self):
         for nt in self.dms.all_targets:
-            for ifaddr in self.ifaddrs:
+            for family, addr in self.notify_interfaces:
                 buf = http_request('NOTIFY', '*', (
                     ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
                     ('NT', nt),
                     ('USN', self.dms.usn_from_target(nt)),
                     ('NTS', 'ssdp:byebye'),))
-                self.sender.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
-                self.logger.debug('SSDP multicasted ssdp:byebye from %s',
-                    self.sender.getsockname())
+                self.ssdp_multicast(family, addr, buf)
+        self.logger.debug('Sent SSDP byebye notifications')
 
     def send_notify(self):
         # TODO for each interface
         # sends should also be delayed 100ms by eventing
-        for nt in self.all_targets:
-            for ifaddr in self.ifaddrs:
+        for nt in self.dms.all_targets:
+            for family, addr in self.notify_interfaces:
                 buf = http_request('NOTIFY', '*', (
                     ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
                     ('CACHE-CONTROL', 'max-age={:d}'.format(
                         self.dms.notify_interval * 2 + EXPIRY_FUDGE)),
                     ('LOCATION', 'http://{}:{:d}{}'.format(
-                        ifaddr,
+                        addr[0],
                         self.http_address[1],
                         ROOT_DESC_PATH)),
                     ('NT', nt),
                     ('NTS', 'ssdp:alive'),
                     ('SERVER', SERVER_FIELD),
                     ('USN', self.usn_from_target(nt))))
-                self.sender.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
-                self.logger.debug('Sent ssdp:alive: %r', buf)
+                self.ssdp_multicast(family, addr, buf)
+        self.logger.debug('Sent SSDP alive notifications')
 
-    def process_request(self, data, peername, sockname):
-        request = http_request_from_bytes(data)
+    def process_request(self, data, peeraddr, sockaddr):
+        request = HTTPRequest.from_bytes(data)
         if request.method != 'M-SEARCH':
             return
         st = request['st']
-        if st in self.all_targets:
+        if st in self.dms.all_targets:
             sts = [st]
         elif st == 'ssdp:all':
-            sts = self.all_targets
+            sts = self.dms.all_targets
         else:
             logging.debug('Ignoring M-SEARCH for %r', st)
             return
-        #for sender
         for st in sts:
-            self.send_msearch_reply(addr, st)
+            self.send_msearch_reply(sockaddr, peeraddr, st)
 
     @property
     def http_address(self):
@@ -296,21 +281,22 @@ class SSDP:
 
     @property
     def max_age(self):
-        return self.device.alive_interval * 2 + EXPIRY_FUDGE
+        return self.dms.notify_interval * 2 + EXPIRY_FUDGE
 
-    def send_msearch_reply(self, addr, st):
-        data = http_response((
+    def send_msearch_reply(self, sockaddr, peeraddr, st):
+        buf = http_response([
             ('CACHE-CONTROL', 'max-age={:d}'.format(self.max_age)),
-            ('DATE', time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())),
+            ('DATE', rfc1123_date()),
             ('EXT', ''),
-            ('LOCATION', 'http://{0[0]}:{0[1]:d}{1}'.format(
-                self.http_address,
+            ('LOCATION', 'http://{}:{:d}{}'.format(
+                sockaddr[0],
+                self.http_address[1],
                 ROOT_DESC_PATH)),
             ('SERVER', SERVER_FIELD),
             ('ST', st),
-            ('USN', self.usn_from_target(st)),))
-        self.send(data, addr)
-        logging.debug('Responded to M-SEARCH from %s: %r', addr, data)
+            ('USN', self.usn_from_target(st))])
+        self.receiver.sendto(buf, peeraddr)
+        logging.debug('Responded to M-SEARCH from %s', peeraddr)
 
 class HTTPRequest:
 
@@ -328,21 +314,25 @@ class HTTPRequest:
     def __contains__(self, key):
         return key.upper() in self.headers
 
-def http_request_from_bytes(data):
-    request = HTTPRequest()
-    header_buf, data = data.split(b'\r\n\r\n', 1)
-    assert not data
-    lines = header_buf.decode('utf-8').split('\r\n')
-    request.method, request.path, request.protocol = lines[0].split()
-    request.path = urllib.parse.unquote(request.path)
-    for h in lines[1:]:
-        name, value = h.split(':', 1)
-        request[name] = value
-    return request
+    @classmethod
+    def from_bytes(cls, buf):
+        req = cls()
+        lines = (a.decode('utf-8') for a in buf.split(b'\r\n'))
+        req.method, req.path, req.protocol = lines.__next__().split()
+        req.path = urllib.parse.unquote(req.path)
+        for h in lines:
+            if h:
+                name, value = h.split(':', 1)
+                req[name] = value
+        return req
 
 def httpify_headers(headers):
     from itertools import chain
-    return '\r\n'.join(': '.join(h) for h in chain(headers, ('',)))
+    def lines():
+        for key, value in headers:
+            assert key, key
+            yield ':'.join([key, ' '+value if value else value])
+    return '\r\n'.join(chain(lines(), ['']))
 
 def http_message(first_line, headers, body):
     return (first_line + '\r\n' + httpify_headers(headers) + '\r\n').encode('utf-8') + body
@@ -449,7 +439,8 @@ def cd_browse_result(root_path, location, **soap_args):
 
 class ResourceRequestHandler:
 
-    def __init__(self, *, socket, request, context):
+    def __init__(self, context):
+        request = context.request
         units, range = request['range'].split('=', 1)
         assert units == 'bytes', units
         start, end = range.split('-', 1)
@@ -457,7 +448,7 @@ class ResourceRequestHandler:
         self.end = int(end) + 1 if end else None
         del start, end, units, range
         self.path = request.path[len(RESOURCE_PATH):]
-        self.file = open(self.path, 'r+b')
+        self.file = open(self.path, 'rb')
         size = os.fstat(self.file.fileno()).st_size
         if self.end is None:
             # TODO: do we have to determine the end of the stream?
@@ -466,14 +457,13 @@ class ResourceRequestHandler:
         else:
             self.end = min(self.end, size)
         self.file.seek(self.start)
-        self.socket = socket
+        self.socket = context.socket
         headers = [
             ('Server', SERVER_FIELD),
             ('Date', rfc1123_date()),
             ('Ext', ''),
             ('transferMode.dlna.org', 'Streaming'),
             ('Content-Type', mimetypes.guess_type(self.path)[0]),
-            # the resource is byte-seekable only and not transcoded
             ('contentFeatures.dlna.org', CONTENT_FEATURES),
             ('Content-Range', 'bytes {:d}-{}/{:d}'.format(
                 self.start,
@@ -487,6 +477,7 @@ class ResourceRequestHandler:
         else:
             headers.append(('Content-Length', str(self.end - self.start)))
         self.buffer = http_response(headers, code=206)
+        self.on_done = context.on_done
 
     def __repr__(self):
         return '<{} path={}, range={}-{}, len(buffer)={}>'.format(
@@ -494,10 +485,6 @@ class ResourceRequestHandler:
             self.path,
             self.start, self.end,
             len(self.buffer))
-
-    def on_done(self):
-        if self.end is None or self.file.tell() != self.end or self.buffer:
-            self.socket.close()
 
     def need_read(self):
         return False
@@ -507,25 +494,24 @@ class ResourceRequestHandler:
 
     def do_write(self):
         if not self.buffer:
-            bufsize = 0x80000 # 512K
+            bufsize = 0x20000 # 128K
             if self.end is not None:
                 bufsize = min(bufsize, self.end - self.file.tell())
             self.buffer = self.file.read(bufsize)
             if not self.buffer:
-                return False
+                self.on_done()
         if self.buffer:
             self.buffer = self.buffer[self.socket.send(self.buffer):]
-        return self.need_write()
+        if not self.need_write():
+            self.on_done()
 
 
 class SendBufferRequestHandler:
 
-    def __init__(self, buffer, *, socket, request, context):
-        self.socket = socket
+    def __init__(self, buffer, context):
+        self.socket = context.socket
         self.buffer = buffer
-
-    def on_done(self):
-        return len(self.buffer) == 0
+        self.on_done = context.on_done
 
     def need_read(self):
         return False
@@ -535,28 +521,30 @@ class SendBufferRequestHandler:
 
     def do_write(self):
         self.buffer = self.buffer[self.socket.send(self.buffer):]
-        return self.need_write()
+        if not self.buffer:
+            self.on_done()
 
 
 class SoapRequestHandler:
 
-    def __init__(self, *, socket, request, context):
-        sa_value = request['soapaction']
-        assert sa_value[0] == '"' and sa_value[-1] == '"', sa_value
-        self.service_type, self.action = sa_value[1:-1].rsplit('#', 1)
+    def __init__(self, context):
+        request = context.request
+        soapact = request['soapaction']
+        assert soapact[0] == '"' and soapact[-1] == '"', soapact
+        self.service_type, self.action = soapact[1:-1].rsplit('#', 1)
         self.content_length = int(request['content-length'])
         self.in_buf = b''
         self.out_buf = b''
-        self.socket = socket
-        self.context = context
+        self.dms = context.dms
         self.request = request
+        self.socket = context.socket
 
     def on_done(self):
         if self.need_read() or self.need_write():
             self.socket.close()
 
     def need_read(self):
-        return len(self.in_buf) != self.content_length
+        return self.content_length - len(self.in_buf)
 
     def need_write(self):
         return self.out_buf
@@ -564,11 +552,13 @@ class SoapRequestHandler:
     def do_read(self):
         data = self.socket.recv(self.content_length - len(self.in_buf))
         if not data:
-            return False
+            # TODO send SOAP error response?
+            logging.error('SOAP request body was not completed: %r', self.in_buf)
+            self.on_done(close=True)
         self.in_buf += data
         del data
         if len(self.in_buf) != self.content_length:
-            return True
+            return
         # we're already looking at the envelope, perhaps I should wrap this
         # with a Document so that absolute lookup is done instead? TODO
         soap_request = etree.fromstring(self.in_buf)
@@ -593,17 +583,18 @@ class SoapRequestHandler:
             ('CONTENT-TYPE', 'text/xml; charset="utf-8"'),
             ('DATE', rfc1123_date()),
             ('EXT', ''),
-            ('SERVER', SERVER_FIELD)], response_body)
-        return True
+            ('SERVER', SERVER_FIELD)
+        ], response_body)
 
     def do_write(self):
         self.out_buf = self.out_buf[self.socket.send(self.out_buf):]
-        return len(self.out_buf) != 0
+        if not self.out_buf:
+            self.on_done()
 
     def soap_Browse(self, **soap_args):
         from xml.sax.saxutils import escape
         result, total_matches = cd_browse_result(
-            self.context.path,
+            self.dms.path,
             'http://' + self.request['host'],
             **soap_args)
         return dict(
@@ -616,7 +607,10 @@ class SoapRequestHandler:
     def soap_GetSortCapabilities(self, **soap_args):
         return {'SortCaps': 'dc:title'}
 
+
 class SoapAction: pass
+class RequestHandlerContext: pass
+
 
 class HTTPConnection:
 
@@ -635,9 +629,11 @@ class HTTPConnection:
         self.handler = None
 
     def recv(self, *args, **kwargs):
+        assert not self.handler, self.handler
         return self._socket.recv(*args, **kwargs)
 
     def send(self, *args, **kwargs):
+        assert not self.handler, self.handler
         return self._socket.send(*args, **kwargs)
 
     def fileno(self):
@@ -651,26 +647,25 @@ class HTTPConnection:
 
     def do_write(self):
         try:
-            notdone = self.handler.do_write()
+            self.handler.do_write()
         except socket.error as exc:
             if exc.errno not in [errno.ENOTCONN]:
                 raise
-        else:
-            if notdone:
-                return
-        self.handler_done()
+            self.logger.exception('Error during handler write')
+            self.handler_done(close=True)
 
-    def handler_done(self):
-        #self.handler.on_done()
-        self.handler = None
-        if 'connection' in self.request and \
+    def handler_done(self, close=False):
+        assert self.handler is not None, self.handler
+        assert self.request is not None, self.request
+        if close or 'connection' in self.request and \
                 self.request['connection'].lower() == 'close':
-            pass
-        self.close()
+            self.close()
+        self.handler = None
         self.request = None
 
     def do_read(self):
         if self.handler is None:
+            ## determine bufsize so that body is left in the socket
             peek_data = self.recv(0x1000, socket.MSG_PEEK)
             index = (self.buffer + peek_data).find(HTTP_BODY_SEPARATOR)
             assert index >= -1, index
@@ -679,31 +674,36 @@ class HTTPConnection:
             else:
                 bufsize = index - len(self.buffer) + len(HTTP_BODY_SEPARATOR)
             assert bufsize <= len(peek_data), (bufsize, len(peek_data))
+
             data = self.recv(bufsize)
-            assert data == peek_data[:bufsize]
-            if data:
-                self.buffer += data
-                del data
-                if index != -1:
-                    logging.debug('Complete HTTP request arrived: %r', self.buffer)
-                    request = http_request_from_bytes(self.buffer)
-                    self.buffer = b''
-                    factory = self.handler_factory_new(request)
-                    if factory is None:
-                        self.close()
-                    else:
-                        assert self.handler is None, self.handler
-                        self.handler = factory(
-                            socket=self,
-                            request=request,
-                            context=self.dms)
-                        self.request = request
-            else:
-                assert not self.buffer, self.buffer
+            assert data == peek_data[:bufsize], (data, peek_data)
+            if not data:
                 self.close()
+                return
+            self.buffer += data
+            del data, bufsize, peek_data
+
+            # complete header hasn't arrived yet
+            if index == -1:
+                return
+            del index
+
+            request = HTTPRequest.from_bytes(self.buffer)
+            logging.debug('Received HTTP request: %s', request)
+            self.buffer = b''
+            factory = self.handler_factory_new(request)
+            if factory is None:
+                self.close()
+                return
+            context = RequestHandlerContext()
+            context.socket = self._socket
+            context.on_done = self.handler_done
+            context.request = request
+            context.dms = self.dms
+            self.handler = factory(context=context)
+            self.request = request
         else:
-            if not self.handler.do_read():
-                self.handler_done()
+            self.handler.do_read()
 
     def handler_factory_new(self, request):
         '''Returns None if the request cannot be handled. Otherwise returns a callable that takes socket, request and done callback named arguments to handle the request.'''
@@ -726,7 +726,7 @@ class HTTPConnection:
                 return send_description(self.dms.device_desc)
             for service in SERVICE_LIST:
                 if request.path == service.SCPDURL:
-                    return self.handler_from_description(service.xmlDescription)
+                    return send_description(service.xmlDescription)
             if request.path.startswith(RESOURCE_PATH):
                 return ResourceRequestHandler
         elif request.method in ['POST']:
@@ -738,11 +738,12 @@ class HTTPConnection:
             return None
         assert False, (request.method, request.path)
 
-    def __str__(self):
+    def __repr__(self):
         return '<{} handler={}, buffer={!r}>'.format(
             self.__class__.__name__,
             self.handler,
             self.buffer,)
+
 
 class HTTPServer:
 
@@ -781,8 +782,8 @@ class HTTPServer:
 
 class DMS:
 
-    def __init__(self, hosts, port, path):
-        self.ssdp = SSDP(hosts, self)
+    def __init__(self, port, path):
+        self.ssdp = SSDP(self)
         # there is much more to it than this
         self.device_uuid = 'uuid:deadbeef-0000-0000-0000-0000000b00b5'
         self.notify_interval = 895
@@ -807,10 +808,10 @@ class DMS:
                 del timeout
             r = [c for c in channels if c.need_read()]
             w = [c for c in channels if c.need_write()]
-            for c in channels:
-                if c not in r and c not in w:
-                    assert False, c
-                    self.http_conns.remove(c)
+            #for c in channels:
+                #if c not in r and c not in w:
+                    #assert False, c
+                    #self.http_conns.remove(c)
             logging.debug('Polling with timeout: %s', timeout)
             r, w, x = select.select(r, w, r + w, timeout)
             assert not x, x
@@ -857,18 +858,24 @@ class DMS:
 
 def main():
     logging.basicConfig(stream=sys.stderr, level=0)
+
     from optparse import OptionParser
-    parser = OptionParser()
-    parser.add_option('-a', '--address', action='append', default=[],
-        help='notify from ADDRESS')
-    #parser.add_option('-i', '--interface', action='append',
-    #    help='listen on INTERFACE')
+    parser = OptionParser(
+        usage='%prog [options] [PATH]',
+        description='Serves media from the given PATH over UPnP AV and DLNA.')
     parser.add_option('-p', '--port', type='int', default=1337,
         help='media server listen PORT')
     opts, args = parser.parse_args()
-    print(opts, args)
-    assert len(args) == 1, args
-    DMS(opts.address, opts.port, os.path.normpath(args[0]))
+    logging.debug('Parsed opts=%s args=%s', opts, args)
+    if len(args) == 0:
+        path = os.curdir
+    elif len(args) == 1:
+        path = args[0]
+    else:
+        parser.error('Only one path is allowed')
+    path = os.path.normpath(path)
+
+    DMS(opts.port, path)
 
 if __name__ == '__main__':
     main()
