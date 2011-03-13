@@ -6,6 +6,10 @@ from ctypes import (
     c_ushort, c_char, c_byte, c_void_p, c_char_p, c_uint, c_int, c_uint16, c_uint32
 )
 from ctypes.util import find_library
+import collections
+import pdb
+
+IFF_LOOPBACK = 0x8
 
 #struct sockaddr
   #{
@@ -117,15 +121,38 @@ class union_ifa_ifu(Union):
         ('ifu_dstaddr', POINTER(struct_sockaddr)),]
 
 class struct_ifaddrs(Structure):
+    pass
 
-    _fields_ = [
-        ('ifa_next', c_void_p),
-        ('ifa_name', c_char_p),
-        ('ifa_flags', c_uint),
-        ('ifa_addr', POINTER(struct_sockaddr)),
-        ('ifa_netmask', POINTER(struct_sockaddr)),
-        #('ifa_ifu', union_ifa_ifu),
-        ('ifa_data', c_void_p),]
+struct_ifaddrs._fields_ = [
+    ('ifa_next', POINTER(struct_ifaddrs)),
+    ('ifa_name', c_char_p),
+    ('ifa_flags', c_uint),
+    ('ifa_addr', POINTER(struct_sockaddr)),
+    ('ifa_netmask', POINTER(struct_sockaddr)),
+    #('ifa_ifu', union_ifa_ifu),
+    ('ifa_data', c_void_p),]
+
+py_ifaddrs = collections.namedtuple('py_ifaddrs', [
+    'name',
+    'flags',
+    'family',
+    'addr',
+    'netmask'])
+
+class py_ifaddrs:
+
+    __slots__ = 'name', 'flags', 'family', 'addr', 'netmask'
+
+    def __init__(self, **kwds):
+        for key, value in kwds.items():
+            setattr(self, key, value)
+
+    def __repr__(self):
+        s = self.__class__.__name__ + '('
+        kwargs = {slot: getattr(self, slot) for slot in self.__slots__}
+        kwargs['flags'] = hex(kwargs['flags'])
+        s += ', '.join('{}={}'.format(k, v) for k, v in kwargs.items())
+        return s + ')'
 
 libc = CDLL(find_library('c'))
 _getifaddrs = libc.getifaddrs
@@ -139,10 +166,9 @@ def ifap_iter(ifap):
     ifa = ifap.contents
     while True:
         yield ifa
-        ifa_next = cast(ifa.ifa_next, POINTER(struct_ifaddrs))
-        if not ifa_next:
+        if not ifa.ifa_next:
             break
-        ifa = ifa_next.contents
+        ifa = ifa.ifa_next.contents
 
 class uniquedict(dict):
 
@@ -151,6 +177,25 @@ class uniquedict(dict):
             raise KeyError('Key {!r} already set'.format(key))
         else:
             super().__setitem__(key, value)
+
+def pythonize_sockaddr(sa):
+    from socket import AF_INET, AF_INET6, ntohs, ntohl, inet_ntop
+    family = sa.sa_family
+    if family == AF_INET:
+        sa = cast(pointer(sa), POINTER(struct_sockaddr_in)).contents
+        addr = (
+            inet_ntop(family, sa.sin_addr),
+            ntohs(sa.sin_port))
+    elif family == AF_INET6:
+        sa = cast(pointer(sa), POINTER(struct_sockaddr_in6)).contents
+        addr = (
+            inet_ntop(family, sa.sin6_addr),
+            ntohs(sa.sin6_port),
+            ntohl(sa.sin6_flowinfo),
+            sa.sin6_scope_id)
+    else:
+        addr = None
+    return family, addr
 
 def getifaddrs():
     ifap = POINTER(struct_ifaddrs)()
@@ -163,29 +208,15 @@ def getifaddrs():
         assert False, result
     del result
     try:
-        from collections import defaultdict
-        from socket import (
-            getnameinfo, inet_ntop, ntohs, ntohl,
-            AF_INET, AF_INET6, AF_PACKET)
-        retval = defaultdict(uniquedict)
+        retval = []
         for ifa in ifap_iter(ifap):
-            name = ifa.ifa_name.decode('utf-8')
-            family = ifa.ifa_addr.contents.sa_family
-            if family == AF_INET:
-                sa = cast(ifa.ifa_addr, POINTER(struct_sockaddr_in)).contents
-                addr = (
-                    inet_ntop(family, sa.sin_addr),
-                    ntohs(sa.sin_port))
-            elif family == AF_INET6:
-                sa = cast(ifa.ifa_addr, POINTER(struct_sockaddr_in6)).contents
-                addr = (
-                    inet_ntop(family, sa.sin6_addr),
-                    ntohs(sa.sin6_port),
-                    ntohl(sa.sin6_flowinfo),
-                    sa.sin6_scope_id)
-            else:
-                addr = None
-            retval[name][family] = addr
+            family, addr = pythonize_sockaddr(ifa.ifa_addr.contents)
+            retval.append(py_ifaddrs(
+                name=ifa.ifa_name,
+                family=family,
+                flags=ifa.ifa_flags,
+                addr=addr,
+                netmask=ifa.ifa_netmask,))
         return retval
     finally:
         _freeifaddrs(ifap)
