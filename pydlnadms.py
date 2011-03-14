@@ -35,10 +35,9 @@ def make_xml_service_description(actions, statevars):
                 SubElement(allowedValueList, 'allowedValue').text = av
     return tostring(scpd).encode('utf-8')
 
+from constant import *
 HTTP_BODY_SEPARATOR = b'\r\n' * 2
 EXPIRY_FUDGE = 10
-SSDP_PORT = 1900
-SSDP_MCAST_ADDR = '239.255.255.250'
 UPNP_ROOT_DEVICE = 'upnp:rootdevice'
 UPNP_DOMAIN_NAME = 'schemas-upnp-org'
 ROOT_DESC_PATH = '/rootDesc.xml'
@@ -110,95 +109,8 @@ def make_device_desc(udn):
     return tostring(root).encode('utf-8')
 
 
-class SocketWrapper:
-
-    def __init__(self, socket_):
-        self.__socket = socket_
-        self.__closed = False
-        try:
-            self.peername = self.__socket.getpeername()
-        except socket.error as exc:
-            if exc.errno in [errno.ENOTCONN]:
-                self.peername = None
-            else:
-                raise
-        self.sockname = self.__socket.getsockname()
-
-    def getsockname(self):
-        return self.__socket.getsockname()
-
-    def send(self, data):
-        sockname = self.__socket.getsockname()
-        peername = self.__socket.getpeername()
-        sent = self.__socket.send(data)
-        fmt = 'Sent %s bytes on %s to %s'
-        args = [sent, sockname, peername]
-        if sent <= 24 * 80:
-            fmt += ': %r'
-            args += [data[:sent]]
-        logging.debug(fmt, *args)
-        return sent
-
-    def sendto(self, buf, addr):
-        sent = self.__socket.sendto(buf, addr)
-        logging.debug('Sent %s bytes from %s to %s: %r', sent,
-            self.__socket.getsockname(), addr, buf[:sent])
-        return sent
-
-    def recv(self, bufsize, flags=0):
-        data = self.__socket.recv(bufsize, flags)
-        from socket import MSG_PEEK
-        if flags & MSG_PEEK:
-            logging.debug('Peeked at %s bytes', len(data))
-        else:
-            logging.debug('Received %s bytes on %s%s: %r',
-                len(data),
-                self.__socket.getsockname(),
-                self.peername,
-                data)
-        return data
-
-    def recvfrom(self, *args, **kwds):
-        buf, addr = self.__socket.recvfrom(*args, **kwds)
-        logging.debug('Received %s bytes on %s%s: %r',
-            len(buf), self.sockname, addr, buf)
-        return buf, addr
-
-    def fileno(self):
-        return self.__socket.fileno()
-
-    def close(self):
-        assert not self.__closed
-        self.__socket.close()
-        logging.debug('Closed socket: %s', self)
-        self.__closed = True
-
-    def __repr__(self):
-        return '<SocketWrapper sock={} peer={}>'.format(
-            self.sockname,
-            self.peername,)
-
-
-class SSDPReceiver(SocketWrapper):
-
-    def __init__(self, master):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
-        s.bind(('', SSDP_PORT))
-        super().__init__(s)
-        self.master = master
-
-    def need_read(self):
-        return True
-
-    def need_write(self):
-        return False
-
-    def do_read(self):
-        # MTU should limit UDP packet sizes to well below this
-        data, addr = self.recvfrom(0x1000)
-        assert len(data) < 0x1000, len(addr)
-        self.master.process_request(data, addr, self.getsockname())
+from socket_wrapper import SocketWrapper
+from ssdp_receiver import SSDPReceiver
 
 
 class SSDP:
@@ -649,7 +561,7 @@ class HTTPConnection:
         try:
             self.handler.do_write()
         except socket.error as exc:
-            if exc.errno not in [errno.ENOTCONN]:
+            if exc.errno not in [errno.ENOTCONN, errno.EPIPE]:
                 raise
             self.logger.exception('Error during handler write')
             self.handler_done(close=True)
