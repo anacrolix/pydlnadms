@@ -154,6 +154,14 @@ class py_ifaddrs:
         s += ', '.join('{}={}'.format(k, v) for k, v in kwargs.items())
         return s + ')'
 
+class struct_in_pktinfo(Structure):
+
+    _fields_ = [
+        ('ipi_ifindex', ctypes.c_uint),
+        ('ipi_spec_dst', struct_in_addr),
+        ('ipi_addr', struct_in_addr)]
+
+
 libc = CDLL(find_library('c'))
 _getifaddrs = libc.getifaddrs
 _getifaddrs.restype = c_int
