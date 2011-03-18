@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 from ctypes import (
-    Structure, Union, POINTER, CDLL,
+    Structure, Union, POINTER,
     pointer, get_errno, cast,
     c_ushort, c_char, c_byte, c_void_p, c_char_p, c_uint, c_int, c_uint16, c_uint32
 )
-from ctypes.util import find_library
+import ctypes.util
+import ctypes
 import collections
 import pdb
 
@@ -162,7 +163,7 @@ class struct_in_pktinfo(Structure):
         ('ipi_addr', struct_in_addr)]
 
 
-libc = CDLL(find_library('c'))
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
 _getifaddrs = libc.getifaddrs
 _getifaddrs.restype = c_int
 _getifaddrs.argtypes = [POINTER(POINTER(struct_ifaddrs))]
