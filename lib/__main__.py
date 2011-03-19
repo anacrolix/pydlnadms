@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# filetype=python
+# filetype=python3
 
 def main():
     from optparse import OptionParser
@@ -29,7 +29,7 @@ def main():
     path = os.path.normpath(path)
 
     # import this AFTER logging config has been processed
-    from _pydlnadms import DigitalMediaServer
+    from pydlnadms import DigitalMediaServer
     DigitalMediaServer(opts.port, path)
 
 if __name__ == '__main__':
