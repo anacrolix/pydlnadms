@@ -23,11 +23,9 @@ class SocketWrapper:
         return self.__socket.getsockname()
 
     def send(self, data):
-        sockname = self.__socket.getsockname()
-        peername = self.__socket.getpeername()
         sent = self.__socket.send(data)
         fmt = 'Sent %s bytes on %s to %s'
-        args = [sent, sockname, peername]
+        args = [sent, self.sockname, self.peername]
         if sent <= 24 * 80:
             fmt += ': %r'
             args += [data[:sent]]

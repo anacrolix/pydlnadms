@@ -135,6 +135,7 @@ class Connection:
         try:
             self.handler.do_write()
         except socket.error as exc:
+            import errno
             if exc.errno not in [errno.ENOTCONN, errno.EPIPE]:
                 raise
             self.logger.exception('Error during handler write')
@@ -216,7 +217,7 @@ class Connection:
                 if request.path == service.SCPDURL:
                     return send_description(service.xmlDescription)
             if request.path.startswith(RESOURCE_PATH):
-                return ResourceRequestHandler
+                return request_handlers.Resource
         elif request.method in ['POST']:
             if request.path in (
                     service.controlURL for service in SERVICE_LIST):

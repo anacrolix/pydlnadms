@@ -13,6 +13,7 @@ class Resource:
         del start, end, units, range
         self.path = request.path[len(RESOURCE_PATH):]
         self.file = open(self.path, 'rb')
+        import os
         size = os.fstat(self.file.fileno()).st_size
         if self.end is None:
             # TODO: do we have to determine the end of the stream?
@@ -22,9 +23,11 @@ class Resource:
             self.end = min(self.end, size)
         self.file.seek(self.start)
         self.socket = context.socket
+        from . import http
+        import mimetypes
         headers = [
             ('Server', SERVER_FIELD),
-            ('Date', rfc1123_date()),
+            ('Date', http.rfc1123_date()),
             ('Ext', ''),
             ('transferMode.dlna.org', 'Streaming'),
             ('Content-Type', mimetypes.guess_type(self.path)[0]),
@@ -40,7 +43,7 @@ class Resource:
             headers.append(('Connection', 'close'))
         else:
             headers.append(('Content-Length', str(self.end - self.start)))
-        self.buffer = http_response(headers, code=206)
+        self.buffer = http.Response(headers, code=206).to_bytes()
         self.on_done = context.on_done
 
     def __repr__(self):
@@ -120,7 +123,8 @@ def didl_lite(content):
 
 def cd_object_xml(path, location, parent_id):
     '''Returns a DIDL response object XML snippet'''
-    #import os.path
+    from xml.etree import ElementTree as etree
+    import mimetypes, os, os.path, urllib.parse
     isdir = os.path.isdir(path)
     element = etree.Element(
         'container' if isdir else 'item',
@@ -137,7 +141,6 @@ def cd_object_xml(path, location, parent_id):
         protocolInfo='http-get:*:{}:{}'.format(
             mimetypes.guess_type(path)[0],
             CONTENT_FEATURES))
-    # TODO fix this absolute address
     res_elt.text = location + RESOURCE_PATH + urllib.parse.quote(path)
     if not isdir:
         res_elt.set('size', str(os.path.getsize(path)))
@@ -161,7 +164,8 @@ def object_id_to_path(root_path, object_id):
         return object_id
 
 def cd_browse_result(root_path, location, **soap_args):
-    """(list of CD objects in XML, total possible elements)"""
+    '''(list of CD objects in XML, total possible elements)'''
+    import os, os.path
     path = object_id_to_path(root_path, soap_args['ObjectID'])
     if soap_args['BrowseFlag'] == 'BrowseDirectChildren':
         entries = sorted(os.listdir(path))
@@ -192,10 +196,11 @@ class Soap:
         self.dms = context.dms
         self.request = request
         self.socket = context.socket
+        self.on_done = context.on_done
 
-    def on_done(self):
-        if self.need_read() or self.need_write():
-            self.socket.close()
+    # TODO neatly report SOAP info
+    #def __repr__(self):
+        #return '<
 
     def need_read(self):
         return self.content_length - len(self.in_buf)
@@ -242,7 +247,7 @@ class Soap:
             ('DATE', http.rfc1123_date()),
             ('EXT', ''),
             ('SERVER', SERVER_FIELD)
-        ], response_body).to_bytes()
+        ], response_body, code=200).to_bytes()
 
     def do_write(self):
         self.out_buf = self.out_buf[self.socket.send(self.out_buf):]

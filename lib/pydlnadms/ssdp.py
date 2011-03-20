@@ -72,7 +72,7 @@ class SSDP:
         elif st == 'ssdp:all':
             sts = self.dms.all_targets
         else:
-            logging.debug('Ignoring M-SEARCH for %r', st)
+            self.logger.debug('Ignoring M-SEARCH for %r', st)
             return
         for st in sts:
             self.send_msearch_reply(sockaddr, peeraddr, st)
