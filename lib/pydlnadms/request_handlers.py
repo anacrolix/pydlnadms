@@ -61,7 +61,7 @@ class Resource:
 
     def do_write(self):
         if not self.buffer:
-            bufsize = 0x20000 # 128K
+            bufsize = 0x20000 # 128Ki
             if self.end is not None:
                 bufsize = min(bufsize, self.end - self.file.tell())
             self.buffer = self.file.read(bufsize)

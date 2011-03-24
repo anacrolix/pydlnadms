@@ -100,6 +100,8 @@ class RequestHandlerContext: pass
 
 class Connection:
 
+    __slots__ = 'pollmap', 'buffer', 'dms', 'handler', '_socket'
+
     logger = logging.getLogger('http')
 
     def __init__(self, socket, dms, pollmap):
@@ -110,17 +112,9 @@ class Connection:
         self._socket = socket
 
     def close(self):
+        assert self.handler is None, self.handler
         self._socket.close()
         self.pollmap.remove(self)
-        self.handler = None
-
-    def recv(self, *args, **kwargs):
-        assert not self.handler, self.handler
-        return self._socket.recv(*args, **kwargs)
-
-    def send(self, *args, **kwargs):
-        assert not self.handler, self.handler
-        return self._socket.send(*args, **kwargs)
 
     def fileno(self):
         return self._socket.fileno()
@@ -143,17 +137,14 @@ class Connection:
 
     def handler_done(self, close=False):
         assert self.handler is not None, self.handler
-        assert self.request is not None, self.request
-        if close or 'connection' in self.request and \
-                self.request['connection'].lower() == 'close':
-            self.close()
         self.handler = None
-        self.request = None
+        if close:
+            self.close()
 
     def do_read(self):
         if self.handler is None:
             ## determine bufsize so that body is left in the socket
-            peek_data = self.recv(0x1000, socket.MSG_PEEK)
+            peek_data = self._socket.recv(0x1000, socket.MSG_PEEK)
             index = (self.buffer + peek_data).find(BODY_SEPARATOR)
             assert index >= -1, index
             if index == -1:
@@ -162,7 +153,7 @@ class Connection:
                 bufsize = index - len(self.buffer) + len(BODY_SEPARATOR)
             assert bufsize <= len(peek_data), (bufsize, len(peek_data))
 
-            data = self.recv(bufsize)
+            data = self._socket.recv(bufsize)
             assert data == peek_data[:bufsize], (data, peek_data)
             if not data:
                 self.close()
@@ -188,12 +179,11 @@ class Connection:
             context.request = request
             context.dms = self.dms
             self.handler = factory(context=context)
-            self.request = request
         else:
             self.handler.do_read()
 
     def handler_factory_new(self, request):
-        '''Returns None if the request cannot be handled. Otherwise returns a callable that takes socket, request and done callback named arguments to handle the request.'''
+        '''Returns None if the request cannot be handled. Otherwise returns a callable that takes a request context.'''
         from . import request_handlers
         def send_buffer(buf):
             return functools.partial(request_handlers.SendBuffer, buf)
