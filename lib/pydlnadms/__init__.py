@@ -68,6 +68,7 @@ class DigitalMediaServer:
             channels = [self.http_server] + self.ssdp.channels + self.http_conns
             readset =  [chan for chan in channels if chan.need_read()]
             writeset = [chan for chan in channels if chan.need_write()]
+            self.logger.debug('Selecting on channels: %s', channels)
             for chan in channels:
                 assert chan in readset or chan in writeset, chan
 

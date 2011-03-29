@@ -29,7 +29,10 @@ class SocketWrapper:
         if sent <= 24 * 80:
             fmt += ': %r'
             args += [data[:sent]]
-        self.logger.debug(fmt, *args)
+            self.logger.debug(fmt, *args)
+        else:
+            self.logger.debug(fmt, *args)
+            self.logger.debug('%r', data[:sent])
         return sent
 
     def sendto(self, buf, addr):

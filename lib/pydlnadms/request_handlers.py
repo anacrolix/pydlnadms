@@ -1,9 +1,22 @@
 from .constant import *
+import logging
+logger = logging.getLogger('pydlnadms')
+del logging
+
+def guess_mimetype(path):
+    from mimetypes import guess_type
+    type = guess_type(path)[0]
+    if type is None:
+        type = 'application/octet-stream'
+    return type
+    #return 'video/x-msvideo'
+    #return 'video/MP2T'
 
 
 class Resource:
 
     def __init__(self, context):
+        self.on_done = context.on_done
         request = context.request
         units, range = request['range'].split('=', 1)
         assert units == 'bytes', units
@@ -11,8 +24,13 @@ class Resource:
         self.start = int(start) if start else 0
         self.end = int(end) + 1 if end else None
         del start, end, units, range
-        self.path = request.path[len(RESOURCE_PATH):]
-        self.file = open(self.path, 'rb')
+        self.path = request.query['path'][-1]
+        try:
+            self.file = open(self.path, 'rb')
+        except IOError as exc:
+            if exc.errno == errno.ENOENT:
+                logger.exception('Error in resource request handler')
+            self.on_done(close=True)
         import os
         size = os.fstat(self.file.fileno()).st_size
         if self.end is None:
@@ -24,13 +42,12 @@ class Resource:
         self.file.seek(self.start)
         self.socket = context.socket
         from . import http
-        import mimetypes
         headers = [
             ('Server', SERVER_FIELD),
             ('Date', http.rfc1123_date()),
             ('Ext', ''),
             ('transferMode.dlna.org', 'Streaming'),
-            ('Content-Type', mimetypes.guess_type(self.path)[0]),
+            ('Content-Type', guess_mimetype(self.path)),
             ('contentFeatures.dlna.org', CONTENT_FEATURES),
             ('Content-Range', 'bytes {:d}-{}/{:d}'.format(
                 self.start,
@@ -44,7 +61,6 @@ class Resource:
         else:
             headers.append(('Content-Length', str(self.end - self.start)))
         self.buffer = http.Response(headers, code=206).to_bytes()
-        self.on_done = context.on_done
 
     def __repr__(self):
         return '<{} path={}, range={}-{}, len(buffer)={}>'.format(
@@ -95,13 +111,13 @@ class SendBuffer:
 def soap_action_response(service_type, action_name, arguments):
     return '''<?xml version="1.0"?>
 <s:Envelope
-xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
-s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body>
-<u:{actionName}Response xmlns:u="{serviceType}">
-{argumentXML}
-</u:{actionName}Response>
-</s:Body>
+        xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+        s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+    <s:Body>
+        <u:{actionName}Response xmlns:u="{serviceType}">
+            {argumentXML}
+        </u:{actionName}Response>
+    </s:Body>
 </s:Envelope>'''.format(
         actionName=action_name,
         argumentXML='\n'.join([
@@ -111,10 +127,10 @@ s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 
 def didl_lite(content):
     return ('''<DIDL-Lite
-            xmlns:dc="http://purl.org/dc/elements/1.1/"
-            xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"
-            xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
-            xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"
+    xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
+    xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">
         ''' + content + r'</DIDL-Lite>')
 
 #objects = Objects()
@@ -124,7 +140,7 @@ def didl_lite(content):
 def cd_object_xml(path, location, parent_id):
     '''Returns a DIDL response object XML snippet'''
     from xml.etree import ElementTree as etree
-    import mimetypes, os, os.path, urllib.parse
+    import os, os.path, urllib.parse
     isdir = os.path.isdir(path)
     element = etree.Element(
         'container' if isdir else 'item',
@@ -139,15 +155,21 @@ def cd_object_xml(path, location, parent_id):
         class_elt.text = 'object.item.videoItem'
     res_elt = etree.SubElement(element, 'res',
         protocolInfo='http-get:*:{}:{}'.format(
-            mimetypes.guess_type(path)[0],
+            guess_mimetype(path),
             CONTENT_FEATURES))
-    res_elt.text = location + RESOURCE_PATH + urllib.parse.quote(path)
+    scheme, netloc = location
+    res_elt.text = urllib.parse.urlunsplit((
+        scheme,
+        netloc,
+        RESOURCE_PATH,
+        urllib.parse.urlencode([('path', path)]),
+        None))
     if not isdir:
         res_elt.set('size', str(os.path.getsize(path)))
         from metadata_ff import res_data
         for attr, value in res_data(path).items():
             res_elt.set(attr, str(value))
-    return etree.tostring(element)
+    return etree.tostring(element, encoding='unicode')
 
 def path_to_object_id(root_path, path):
     # TODO prevent escaping root directory
@@ -181,7 +203,8 @@ def cd_browse_result(root_path, location, **soap_args):
         return elements, len(entries)
     else:
         parent_id = path_to_object_id(os.path.normpath(os.path.split(path)[0]))
-        return [cd_object_xml(path, parent_id)], 1
+        return [cd_object_xml(path, location, parent_id)], 1
+
 
 class Soap:
 
@@ -258,7 +281,7 @@ class Soap:
         from xml.sax.saxutils import escape
         result, total_matches = cd_browse_result(
             self.dms.path,
-            'http://' + self.request['host'],
+            ('http', self.request['host']),
             **soap_args)
         return dict(
                 Result=escape(didl_lite(''.join(result))),

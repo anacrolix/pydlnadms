@@ -1,6 +1,8 @@
 from .constant import *
 import logging # deleted at end of module
+logger = logging.getLogger('http')
 import socket
+import urllib.parse
 
 BODY_SEPARATOR = b'\r\n' * 2
 
@@ -24,12 +26,18 @@ class Message:
 
 class Request:
 
-    __slots__ = 'method', 'path', 'protocol', 'headers', 'body'
+    __slots__ = 'method', 'path', 'protocol', 'headers', 'body', 'query'
 
-    def __init__(self, method, path, headers=None, body=b''):
+    def __init__(self, method, resource, headers=None, body=b''):
         self.method = method
         self.headers = headers or {}
-        self.path = path
+        split_result = urllib.parse.urlsplit(resource)
+        self.query = urllib.parse.parse_qs(split_result.query)
+        self.path = urllib.parse.unquote(split_result.path)
+        if split_result.fragment:
+            logger.warning(
+                'Unused fragment in HTTP request resource: %r',
+                split_result.fragment)
         self.body = body
 
     def __setitem__(self, key, value):
@@ -102,7 +110,7 @@ class Connection:
 
     __slots__ = 'pollmap', 'buffer', 'dms', 'handler', '_socket'
 
-    logger = logging.getLogger('http')
+    logger = logger
 
     def __init__(self, socket, dms, pollmap):
         self.pollmap = pollmap
@@ -206,7 +214,7 @@ class Connection:
             for service in SERVICE_LIST:
                 if request.path == service.SCPDURL:
                     return send_description(service.xmlDescription)
-            if request.path.startswith(RESOURCE_PATH):
+            if request.path == RESOURCE_PATH:
                 return request_handlers.Resource
         elif request.method in ['POST']:
             if request.path in (
@@ -261,6 +269,13 @@ class Server:
         sock, addr = self.socket.accept()
         self.logger.debug('Accepted connection from %s', addr)
         self.master.on_server_accept(sock)
+
+    def __repr__(self):
+        return '<{}.{} socket={} master={}>'.format(
+            self.__class__.__module__,
+            self.__class__.__name__,
+            self.socket,
+            self.master)
 
 
 del logging
