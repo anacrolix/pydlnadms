@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # filetype=python3
 
+import os, os.path
+
 def main():
     from optparse import OptionParser
     parser = OptionParser(
@@ -10,16 +12,26 @@ def main():
         '-p', '--port', type='int', default=1337,
         help='media server listen PORT')
     parser.add_option(
-        '--logging-conf', default='logging.conf',
+        '--logging-conf',
         help='Path of Python logging configuration file')
     opts, args = parser.parse_args()
 
     import logging, logging.config
-    logging.config.fileConfig(opts.logging_conf)
+    if opts.logging_conf is None:
+        formatter = logging.Formatter(
+            '%(asctime)s.%(msecs)3d;%(levelname)s;%(name)s;%(message)s',
+            datefmt='%H:%M:%S')
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+    else:
+        logging.config.fileConfig(opts.logging_conf)
     logger = logging.getLogger('pydlnadms.main')
     logger.debug('Parsed opts=%r args=%r', opts, args)
+    del logging
 
-    import os, os.path
     if len(args) == 0:
         path = os.curdir
     elif len(args) == 1:
