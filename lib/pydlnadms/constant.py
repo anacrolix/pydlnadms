@@ -48,7 +48,7 @@ def make_xml_service_description(actions, statevars):
             allowedValueList = SubElement(stateVariable, 'allowedValueList')
             for av in rest[0]:
                 SubElement(allowedValueList, 'allowedValue').text = av
-    return tostring(scpd).encode('utf-8')
+    return tostring(scpd)#.encode('utf-8')
 
 SERVICE_LIST = []
 for service, domain, version, actions, statevars in [

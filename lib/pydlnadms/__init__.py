@@ -21,7 +21,7 @@ def make_device_desc(udn):
         service_elt = SubElement(serviceList, 'service')
         for tag in DEVICE_DESC_SERVICE_FIELDS:
             SubElement(service_elt, tag).text = getattr(service, tag)
-    return tostring(root).encode('utf-8')
+    return tostring(root)#.encode('utf-8')
 
 
 import heapq, select, time
