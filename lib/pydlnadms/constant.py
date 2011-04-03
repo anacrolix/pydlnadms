@@ -1,4 +1,5 @@
-import platform as _platform
+import getpass
+import platform
 from collections import namedtuple as _namedtuple
 
 EXPIRY_FUDGE = 10
@@ -6,9 +7,11 @@ UPNP_ROOT_DEVICE = 'upnp:rootdevice'
 UPNP_DOMAIN_NAME = 'schemas-upnp-org'
 ROOT_DESC_PATH = '/rootDesc.xml'
 SERVER_FIELD = '{}/{} DLNADOC/1.50 UPnP/1.0 MiniDLNA/1.0'.format(
-    *_platform.linux_distribution()[0:2])
+    *platform.linux_distribution()[0:2])
 ROOT_DEVICE_DEVICE_TYPE = 'urn:schemas-upnp-org:device:MediaServer:1'
-ROOT_DEVICE_FRIENDLY_NAME = 'Anacrolix fucking serveR!!'
+ROOT_DEVICE_FRIENDLY_NAME = 'pydlnadms: {!r} on {!r}'.format(
+    getpass.getuser(), platform.node())
+
 ROOT_DEVICE_MANUFACTURER = 'Matt Joiner'
 ROOT_DEVICE_MODEL_NAME = 'pydlnadms 0.1'
 DEVICE_DESC_SERVICE_FIELDS = 'serviceType', 'serviceId', 'SCPDURL', 'controlURL', 'eventSubURL'

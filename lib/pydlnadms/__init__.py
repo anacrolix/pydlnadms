@@ -21,7 +21,7 @@ def make_device_desc(udn):
         service_elt = SubElement(serviceList, 'service')
         for tag in DEVICE_DESC_SERVICE_FIELDS:
             SubElement(service_elt, tag).text = getattr(service, tag)
-    return tostring(root)#.encode('utf-8')
+    return tostring(root, encoding='utf-8')#.encode('utf-8')
 
 
 import heapq, select, time
@@ -36,7 +36,9 @@ class DigitalMediaServer:
         from .ssdp import SSDP
         self.ssdp = SSDP(self)
         # TODO there is much more to it than this
-        self.device_uuid = 'uuid:deadbeef-0000-0000-0000-0000000b00b5'
+        self.device_uuid = 'uuid:deadbeef-0000-0000-0000-{:012x}'.format(
+            abs(hash(ROOT_DEVICE_FRIENDLY_NAME)))
+        self.logger.info('UUID is %r', self.device_uuid)
         self.notify_interval = 895
         self.device_desc = make_device_desc(self.device_uuid)
         from .http import Server

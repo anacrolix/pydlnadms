@@ -169,7 +169,7 @@ def cd_object_xml(path, location, parent_id):
         from metadata_ff import res_data
         for attr, value in res_data(path).items():
             res_elt.set(attr, str(value))
-    return etree.tostring(element, encoding='unicode')
+    return etree.tostring(element)
 
 def path_to_object_id(root_path, path):
     # TODO prevent escaping root directory
