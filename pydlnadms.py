@@ -139,7 +139,7 @@ for service, domain, version, actions, statevars in [
         eventSubURL='/evt/'+service,
         xmlDescription=make_xml_service_description(actions, statevars)))
 
-BODY_SEPARATOR = b'\r\n' * 2
+HTTP_BODY_SEPARATOR = b'\r\n' * 2
 
 def http_message(first_line, headers, body):
     return (first_line + '\r\n' + httpify_headers(headers) + '\r\n').encode('utf-8') + body
@@ -245,100 +245,71 @@ class RequestHandlerContext:
 
 class HTTPConnection:
 
-    __slots__ = 'pollmap', 'buffer', 'dms', 'handler', '_socket'
-
     logger = logging.getLogger('http.conn')
 
-    def __init__(self, socket, dms, pollmap):
-        self.pollmap = pollmap
-        self.buffer = b''
+    def __init__(self, socket, dms):
         self.dms = dms
-        self.handler = None
-        self._socket = socket
+        self.socket = socket
 
-    def close(self):
-        assert self.handler is None, self.handler
-        self._socket.close()
-        self.pollmap.remove(self)
-
-    def fileno(self):
-        return self._socket.fileno()
-
-    def need_read(self):
-        return self.handler is None or self.handler.need_read()
-
-    def need_write(self):
-        return self.handler is not None and self.handler.need_write()
-
-    def do_write(self):
-        try:
-            self.handler.do_write()
-        except socket.error as exc:
-            import errno
-            if exc.errno not in [errno.ENOTCONN, errno.EPIPE, errno.ECONNRESET]:
-                raise
-            self.logger.exception('Error during handler write')
-            self.handler_done(close=True)
-
-    def handler_done(self, close=False):
-        assert self.handler is not None, self.handler
-        self.handler.close()
-        self.handler = None
-        if close:
-            self.close()
-
-    def do_read(self):
-        if self.handler is None:
+    def read_request(self):
+        buffer = b''
+        while True:
             ## determine bufsize so that body is left in the socket
-            peek_data = self._socket.recv(0x1000, socket.MSG_PEEK)
-            index = (self.buffer + peek_data).find(BODY_SEPARATOR)
+            peek_data = self.socket.recv(0x1000, socket.MSG_PEEK)
+            index = (buffer + peek_data).find(HTTP_BODY_SEPARATOR)
             assert index >= -1, index
             if index == -1:
                 bufsize = len(peek_data)
             else:
-                bufsize = index - len(self.buffer) + len(BODY_SEPARATOR)
+                bufsize = index - len(buffer) + len(HTTP_BODY_SEPARATOR)
             assert bufsize <= len(peek_data), (bufsize, len(peek_data))
 
-            data = self._socket.recv(bufsize)
+            data = self.socket.recv(bufsize)
             assert data == peek_data[:bufsize], (data, peek_data)
             if not data:
-                self.close()
                 return
-            self.buffer += data
+            buffer += data
             del data, bufsize, peek_data
 
             # complete header hasn't arrived yet
             if index == -1:
-                return
+                continue
             del index
 
             try:
-                request = HTTPRequest.from_bytes(self.buffer)
+                request = HTTPRequest.from_bytes(buffer)
             except ValueError:
                 self.logger.exception('Failed to parse HTTP request')
-                self.close()
                 return
-            self.logger.debug('Received HTTP request:\n%s', self.buffer.decode('utf-8'))
-            self.buffer = b''
-            factory = self.handler_factory_new(request)
-            if factory is None:
-                self.close()
-                return
-            context = RequestHandlerContext()
-            context.socket = self._socket
-            context.on_done = self.handler_done
-            context.request = request
-            context.dms = self.dms
-            self.handler = factory(context=context)
-        else:
-            self.handler.do_read()
+            self.logger.debug('Received HTTP request:\n%s', buffer.decode('utf-8'))
+            del buffer
+            return request
+
+    def run(self):
+        try:
+            while True:
+                request = self.read_request()
+                if not request:
+                    break
+                factory = self.handler_factory_new(request)
+                if factory is None:
+                    return
+                context = RequestHandlerContext()
+                context.socket = self.socket
+                context.request = request
+                context.dms = self.dms
+                handler = factory(context=context)
+                if not handler.run():
+                    break
+        finally:
+            self.socket.close()
 
     def handler_factory_new(self, request):
         '''Returns None if the request cannot be handled. Otherwise returns a callable that takes a request context.'''
         def send_buffer(buf):
             return functools.partial(SendBuffer, buf)
         def soap_action():
-            return Soap
+            return SOAPRequestHandler
         def send_description(desc):
             import functools
             return functools.partial(
@@ -367,14 +338,8 @@ class HTTPConnection:
             return None
         assert False, (request.method, request.path)
 
-    def __repr__(self):
-        return '<{} handler={}, buffer={!r}>'.format(
-            self.__class__.__name__,
-            self.handler,
-            self.buffer,)
 
-
-class Server:
+class HTTPServer:
 
     logger = logging.getLogger('http.server')
 
@@ -421,13 +386,12 @@ class Server:
 
 
 def guess_mimetype(path):
-    return 'video/mpeg'
     from mimetypes import guess_type
     type = guess_type(path)[0]
     if type is None:
         type = 'application/octet-stream'
-    if type == 'video/MP2T':
-        type = 'video/mpeg'
+    #if type == 'video/MP2T':
+    #    type = 'video/mpeg'
     return type
     #return 'video/x-msvideo'
     #return 'video/MP2T'
@@ -474,66 +438,68 @@ class TranscodeResource:
 
     logger = logging
 
+    def __repr__(self):
+        return '<{} cmdline={!r} pid={} exitcode={}>'.format(
+            self.__class__.__name__,
+            subprocess.list2cmdline(self.args),
+            self.__child.pid,
+            self.__child.returncode)
+
     def __init__(self, path, start, end):
         args = ['ffmpeg', '-i', path]
         if start:
             args += ['-ss', start]
         if end:
-            self._length = str(dlna_npt_sec(end) - dlna_npt_sec(start))
-            args += ['-t', self.length]
-        else:
-            self._length = None
+            args += ['-t', str(dlna_npt_sec(end) - dlna_npt_sec(start))]
         args += [
             '-target', 'pal-dvd',
-            #'-vbsf', 'h264_mp4toannexb',
-            #'-vcodec', 'copy',
-            #'-acodec', 'copy',
-            #'-scodec', 'copy',
-            #'-f', 'mpegts',
+            #~ '-vbsf', 'h264_mp4toannexb',
+            #~ '-vcodec', 'copy',
+            #~ '-acodec', 'copy',
+            #~ '-scodec', 'copy',
+            #~ '-timestamp', str(dlna_npt_sec(start)),
+            #~ '-copyts',
+            '-f', 'mpegts',
             '-y', '/dev/stdout']
         logging.info('Starting transcoder: %r', args)
         self.__child = subprocess.Popen(
             args,
             stdin=open(os.devnull, 'rb'),
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-        flags = fcntl.fcntl(self.__child.stdout, fcntl.F_GETFL)
-        fcntl.fcntl(self.__child.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            #~ bufsize=0x40000
+        )
+        #~ flags = fcntl.fcntl(self.__child.stdout, fcntl.F_GETFL)
+        #~ fcntl.fcntl(self.__child.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         thread = threading.Thread(target=self._log_stderr)
         thread.daemon = True
         thread.start()
+        self.args = args
 
     def close(self):
         self.__child.stdout.close()
-        self.__child.terminate()
-        exitcode = self.__child.returncode
-        logging.debug('Transcoder process terminated: %r', exitcode)
+        self.__child.kill()
+        logging.debug('Terminating transcoder: %r', self)
+        self.__child.wait()
+        logging.debug('Transcoder process terminated: %r', self)
 
     def _log_stderr(self):
         while True:
             output = self.__child.stderr.read(0x1000)
             if not output:
                 break
-            self.logger.debug('Output on stderr:\n%s', output.decode())
-        self.logger.info('stderr ended')
+            self.logger.debug('Output on stderr: %r\n%s', self, output.decode('utf-8'))
+        self.logger.info('Stderr ended: %r', self)
 
     def read(self, count):
-        #stderr_output = self.child.stderr.read()
-        #logger.debug('Got %d bytes from stderr', len(stderr_output or ''))
-        #if stderr_output:
-            #logger.info('Transcoder diagnostic: %s', stderr_output)
-        while True:
-            output = self.__child.stdout.read(count)
-            if output:
-                break
-            if self.__child.returncode is not None:
-                break
+        output = self.__child.stdout.read(count)
         logger.debug('Got %d bytes from stdout', len(output or ''))
         return output
 
     @property
     def length(self):
-        return self._length
+        return None
 
 
 class HTTPRange:
@@ -597,8 +563,6 @@ class ResourceRequestHandler:
             npt_range = ranges_field['npt']
             resource = TranscodeResource(path, npt_range.start, npt_range.end)
             npt_range.size = '*'
-            if not resource.length:
-                npt_range.end = ''
             response_headers += [
                 (TIMESEEKRANGE_DLNA_ORG, HTTPRangeField({'npt': npt_range})),
                 ('Content-type', 'video/mpeg'),
@@ -625,7 +589,6 @@ class ResourceRequestHandler:
                 response_headers += [('Connection', 'close')]
         response_headers += [(CONTENTFEATURES_DLNA_ORG, content_features)]
         self.resource = resource
-        self.on_done = context.on_done
         self.socket = context.socket
         self.buffer = HTTPResponse(response_headers, code=206).to_bytes()
         logging.debug('Response header:\n%s', self.buffer.decode())
@@ -636,22 +599,23 @@ class ResourceRequestHandler:
             len(self.buffer),
             self.resource)
 
-    def need_read(self):
-        return False
-
-    def need_write(self):
-        return True
-
-    def do_write(self):
-        if not self.buffer:
-            self.buffer = self.resource.read(0x20000)
-        if self.buffer:
-            self.buffer = self.buffer[self.socket.send(self.buffer):]
-        else:
-            self.on_done(close=True)
-
-    def close(self):
-        self.resource.close()
+    def run(self):
+        try:
+            while self.buffer:
+                while self.buffer:
+                    try:
+                        self.buffer = self.buffer[self.socket.send(self.buffer):]
+                    except:
+                        logging.exception(
+                            'Error sending %d bytes to %s: %r',
+                            len(self.buffer),
+                            self.socket.peername,
+                            self.resource)
+                        return False
+                self.buffer = self.resource.read(0x1000)
+            return self.resource.length
+        finally:
+            self.resource.close()
 
 
 class SendBuffer:
@@ -659,21 +623,11 @@ class SendBuffer:
     def __init__(self, buffer, context):
         self.socket = context.socket
         self.buffer = buffer
-        self.on_done = context.on_done
 
-    def need_read(self):
-        return False
-
-    def need_write(self):
-        return self.buffer
-
-    def do_write(self):
-        self.buffer = self.buffer[self.socket.send(self.buffer):]
-        if not self.buffer:
-            self.on_done()
-
-    def close(self):
-        pass
+    def run(self):
+        while self.buffer:
+            self.buffer = self.buffer[self.socket.send(self.buffer):]
+        return True
 
 
 def soap_action_response(service_type, action_name, arguments):
@@ -749,7 +703,7 @@ class ContentDirectoryService:
             content_features.support_range = True
         res_elt = etree.SubElement(element, 'res',
             protocolInfo='http-get:*:{}:{}'.format(
-                '*' if isdir else guess_mimetype(path),
+                '*' if isdir else 'video/mpeg' if transcode else guess_mimetype(path),
                 content_features))
         res_elt.text = urllib.parse.urlunsplit((
             self.res_scheme,
@@ -805,7 +759,7 @@ class ContentDirectoryService:
             NumberReturned=len(result_elements),
             TotalMatches=total_matches)
 
-class Soap:
+class SOAPRequestHandler:
 
     def __init__(self, context):
         request = context.request
@@ -818,37 +772,22 @@ class Soap:
         self.dms = context.dms
         self.request = request
         self.socket = context.socket
-        self.on_done = context.on_done
 
-    def close(self):
-        pass
+    def read_soap_request(self):
+        buffer = b''
+        while len(buffer) != self.content_length:
+            incoming = self.socket.recv(self.content_length - len(buffer))
+            if not incoming:
+                # TODO send SOAP error response?
+                logging.error('SOAP request body was not completed: %r', buffer)
+                return
+            buffer += incoming
+        return buffer
 
-    # TODO neatly report SOAP info
-    #def __repr__(self):
-        #return '<
-
-    def need_read(self):
-        return self.content_length - len(self.in_buf)
-
-    def need_write(self):
-        return self.out_buf
-
-    def do_read(self):
-        data = self.socket.recv(self.content_length - len(self.in_buf))
-        if not data:
-            # TODO send SOAP error response?
-            logging.error('SOAP request body was not completed: %r', self.in_buf)
-            self.on_done(close=True)
-        self.in_buf += data
-        del data
-
-        if len(self.in_buf) != self.content_length:
-            return
-
+    def run(self):
         # we're already looking at the envelope, perhaps I should wrap this
         # with a Document so that absolute lookup is done instead? TODO
-        from xml.etree import ElementTree as etree
-        soap_request = etree.fromstring(self.in_buf)
+        soap_request = etree.fromstring(self.read_soap_request())
         action_elt = soap_request.find(
             '{{{s}}}Body/{{{u}}}{action}'.format(
                 s='http://schemas.xmlsoap.org/soap/envelope/',
@@ -865,18 +804,15 @@ class Soap:
         response_body = soap_action_response(
             self.service_type,
             self.action, out_args.items()).encode('utf-8')
-        self.out_buf += HTTPResponse([
+        buffer = HTTPResponse([
             ('CONTENT-LENGTH', str(len(response_body))),
             ('CONTENT-TYPE', 'text/xml; charset="utf-8"'),
             ('DATE', rfc1123_date()),
             ('EXT', ''),
             ('SERVER', SERVER_FIELD)
         ], response_body, code=200).to_bytes()
-
-    def do_write(self):
-        self.out_buf = self.out_buf[self.socket.send(self.out_buf):]
-        if not self.out_buf:
-            self.on_done()
+        while buffer:
+            buffer = buffer[self.socket.send(buffer):]
 
     def soap_Browse(self, **soap_args):
         cds = ContentDirectoryService(self.dms.path, 'http', self.request['host'])
@@ -1113,12 +1049,12 @@ class DigitalMediaServer:
     def __init__(self, port, path):
         self.ssdp = SSDP(self)
         # TODO there is much more to it than this
-        self.device_uuid = 'uuid:deadbeef-0000-0000-0000-{:012x}'.format(
-            abs(hash(ROOT_DEVICE_FRIENDLY_NAME)))
+        self.device_uuid = 'uuid:deadbeef-0000-0000-0000-{}'.format(
+            '{:012x}'.format(abs(hash(ROOT_DEVICE_FRIENDLY_NAME)))[-12:])
         self.logger.info('UUID is %r', self.device_uuid)
         self.notify_interval = 895
         self.device_desc = make_device_desc(self.device_uuid)
-        self.http_server = Server(port, self)
+        self.http_server = HTTPServer(port, self)
         self.http_conns = []
         self.events = []
         self.path = path
@@ -1175,9 +1111,10 @@ class DigitalMediaServer:
         self.add_event(self.notify_interval, self.advertise)
 
     def on_server_accept(self, sock):
-        sock.setblocking(False)
-        self.http_conns.append(HTTPConnection(
-            SocketWrapper(sock), self, self.http_conns))
+        blah = HTTPConnection(SocketWrapper(sock), self)
+        thread = threading.Thread(target=blah.run)
+        thread.daemon = True
+        thread.start()
 
     @property
     def all_targets(self):
