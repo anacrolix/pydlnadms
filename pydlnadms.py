@@ -5,6 +5,7 @@ import collections
 import datetime
 from xml.etree import ElementTree as etree
 import fcntl
+import http.client
 import getpass
 import heapq
 import logging # deleted at end of module
@@ -57,6 +58,7 @@ Service = collections.namedtuple(
     'Service',
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
 RESOURCE_PATH = '/res'
+ICON_PATH = '/icon'
 # flags are in hex. trailing 24 zeroes, 26 are after the space
 # "DLNA.ORG_OP=" time-seek-range-supp bytes-range-header-supp
 #CONTENT_FEATURES = 'DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
@@ -246,6 +248,7 @@ class RequestHandlerContext:
 class HTTPConnection:
 
     logger = logging.getLogger('http.conn')
+    HTTPException = http.client.HTTPException
 
     def __init__(self, socket, dms):
         self.dms = dms
@@ -267,7 +270,7 @@ class HTTPConnection:
             data = self.socket.recv(bufsize)
             assert data == peek_data[:bufsize], (data, peek_data)
             if not data:
-                return
+                raise Exception('Peer closed connection')
             buffer += data
             del data, bufsize, peek_data
 
@@ -280,7 +283,7 @@ class HTTPConnection:
                 request = HTTPRequest.from_bytes(buffer)
             except ValueError:
                 self.logger.exception('Failed to parse HTTP request')
-                return
+                raise HTTPException(http.client.BAD_REQUEST)
             self.logger.debug('Received HTTP request:\n%s', buffer.decode('utf-8'))
             del buffer
             return request
@@ -289,11 +292,7 @@ class HTTPConnection:
         try:
             while True:
                 request = self.read_request()
-                if not request:
-                    break
                 factory = self.handler_factory_new(request)
-                if factory is None:
-                    return
                 context = RequestHandlerContext()
                 context.socket = self.socket
                 context.request = request
@@ -327,8 +326,10 @@ class HTTPConnection:
             for service in SERVICE_LIST:
                 if request.path == service.SCPDURL:
                     return send_description(service.xmlDescription)
-            if request.path == RESOURCE_PATH:
+            if request.path in [RESOURCE_PATH, ICON_PATH]:
                 return ResourceRequestHandler
+            else:
+                raise self.HTTPException(http.client.NOT_FOUND)
         elif request.method in ['POST']:
             if request.path in (
                     service.controlURL for service in SERVICE_LIST):
@@ -695,6 +696,12 @@ class ContentDirectoryService:
             class_elt.text = 'object.container.storageFolder'
         else:
             class_elt.text = 'object.item.videoItem'
+            etree.SubElement(element, 'upnp:icon').text = urllib.parse.urlunsplit((
+                self.res_scheme,
+                self.res_netloc,
+                ICON_PATH,
+                urllib.parse.urlencode({'path': path, 'thumbnail': 1}),
+                None))
         content_features = DLNAContentFeatures()
         if transcode:
             content_features.support_time_seek = True
@@ -1034,6 +1041,13 @@ def make_device_desc(udn):
     SubElement(device, 'manufacturer').text = ROOT_DEVICE_MANUFACTURER
     SubElement(device, 'modelName').text = ROOT_DEVICE_MODEL_NAME
     SubElement(device, 'UDN').text = udn
+    iconList = SubElement(device, 'iconList')
+    for icon_attrs in [
+            ('image/png', 48, 48, 8, '/icon?path=VGC+Sonic.png'),
+            ('image/png', 128, 128, 8, '/icon?path=VGC+Sonic+128.png'),]:
+        icon = SubElement(iconList, 'icon')
+        for name, text in zip(('mimetype', 'width', 'height', 'depth', 'url'), icon_attrs):
+            SubElement(icon, name).text = str(text)
     serviceList = SubElement(device, 'serviceList')
     for service in SERVICE_LIST:
         service_elt = SubElement(serviceList, 'service')
@@ -1140,7 +1154,7 @@ def main():
         '-p', '--port', type='int', default=1337,
         help='media server listen PORT')
     parser.add_option(
-        '--logging-conf',
+        '--logging_conf',
         help='Path of Python logging configuration file')
     opts, args = parser.parse_args()
 
