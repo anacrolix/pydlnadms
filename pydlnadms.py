@@ -2,6 +2,7 @@
 # filetype=python3
 
 import collections
+import datetime
 from xml.etree import ElementTree as etree
 import fcntl
 import getpass
@@ -11,12 +12,15 @@ import os
 import os.path
 import platform
 import pprint
+import queue
 import select
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
+from xml.sax.saxutils import escape as xml_escape
 
 
 logger = logging.getLogger()
@@ -55,9 +59,26 @@ Service = collections.namedtuple(
 RESOURCE_PATH = '/res'
 # flags are in hex. trailing 24 zeroes, 26 are after the space
 # "DLNA.ORG_OP=" time-seek-range-supp bytes-range-header-supp
-CONTENT_FEATURES = 'DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
+#CONTENT_FEATURES = 'DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
 SSDP_PORT = 1900
 SSDP_MCAST_ADDR = '239.255.255.250'
+TIMESEEKRANGE_DLNA_ORG = 'TimeSeekRange.dlna.org'
+CONTENTFEATURES_DLNA_ORG = 'contentFeatures.dlna.org'
+
+
+class DLNAContentFeatures:
+
+    def __init__(self):
+        self.support_time_seek = False
+        self.support_range = False
+        self.transcoded = False
+
+    def __str__(self):
+        return 'DLNA.ORG_OP={}{};DLNA.ORG_CI={};DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'.format(
+            ('1' if self.support_time_seek else '0'),
+            ('1' if self.support_range else '0'),
+            ('1' if self.transcoded else '0'),)
+
 
 def make_xml_service_description(actions, statevars):
     from xml.etree.ElementTree import Element, tostring, SubElement
@@ -209,7 +230,8 @@ def httpify_headers(headers):
     def lines():
         for key, value in headers:
             assert key, key
-            yield ':'.join([key, ' '+value if value else value])
+            value = str(value)
+            yield ':'.join([str(key), ' '+value if value else value])
     return '\r\n'.join(chain(lines(), ['']))
 
 def rfc1123_date():
@@ -260,6 +282,7 @@ class HTTPConnection:
 
     def handler_done(self, close=False):
         assert self.handler is not None, self.handler
+        self.handler.close()
         self.handler = None
         if close:
             self.close()
@@ -295,7 +318,7 @@ class HTTPConnection:
                 self.logger.exception('Failed to parse HTTP request')
                 self.close()
                 return
-            self.logger.debug('Received HTTP request: %s', request)
+            self.logger.debug('Received HTTP request:\n%s', self.buffer.decode('utf-8'))
             self.buffer = b''
             factory = self.handler_factory_new(request)
             if factory is None:
@@ -427,43 +450,127 @@ class FileResource:
     def size(self):
         return os.fstat(self.file.fileno()).st_size
 
+    @property
+    def length(self):
+        return (self.size if self.end is None else min(self.size, self.end)) - self.start
+
+    def __repr__(self):
+        return '<FileResource path=%r>' % self.file.name
+
+    def close(self):
+        logging.debug('Closing %r', self)
+        self.file.close()
+
+
+def dlna_npt_sec(npt_time):
+    if ':' in npt_time:
+        hours, mins, secs = map(float, npt_time.split(':'))
+        return datetime.timedelta(hours=hours, minutes=mins, seconds=secs).total_seconds()
+    else:
+        return float(npt_time)
+
 
 class TranscodeResource:
+
+    logger = logging
 
     def __init__(self, path, start, end):
         args = ['ffmpeg', '-i', path]
         if start:
             args += ['-ss', start]
         if end:
-            args += ['-t', end]
+            self._length = str(dlna_npt_sec(end) - dlna_npt_sec(start))
+            args += ['-t', self.length]
+        else:
+            self._length = None
         args += [
-            '-vbsf', 'h264_mp4toannexb',
-            '-vcodec', 'copy',
-            '-acodec', 'copy',
-            '-scodec', 'copy',
-            '-f', 'mpegts',
+            '-target', 'pal-dvd',
+            #'-vbsf', 'h264_mp4toannexb',
+            #'-vcodec', 'copy',
+            #'-acodec', 'copy',
+            #'-scodec', 'copy',
+            #'-f', 'mpegts',
             '-y', '/dev/stdout']
-        self.child = subprocess.Popen(
+        logging.info('Starting transcoder: %r', args)
+        self.__child = subprocess.Popen(
             args,
             stdin=open(os.devnull, 'rb'),
-            stdout=subprocess.PIPE,)
-            #stderr=subprocess.PIPE)
-        def set_non_blocking(fd):
-            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK|flags)
-        #set_non_blocking(self.child.stderr)
-        #set_non_blocking(self.child.stdout)
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        flags = fcntl.fcntl(self.__child.stdout, fcntl.F_GETFL)
+        fcntl.fcntl(self.__child.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        thread = threading.Thread(target=self._log_stderr)
+        thread.daemon = True
+        thread.start()
+
+    def close(self):
+        self.__child.stdout.close()
+        self.__child.terminate()
+        exitcode = self.__child.returncode
+        logging.debug('Transcoder process terminated: %r', exitcode)
+
+    def _log_stderr(self):
+        while True:
+            output = self.__child.stderr.read(0x1000)
+            if not output:
+                break
+            self.logger.debug('Output on stderr:\n%s', output.decode())
+        self.logger.info('stderr ended')
 
     def read(self, count):
         #stderr_output = self.child.stderr.read()
         #logger.debug('Got %d bytes from stderr', len(stderr_output or ''))
         #if stderr_output:
             #logger.info('Transcoder diagnostic: %s', stderr_output)
-        output = self.child.stdout.read(count)
+        while True:
+            output = self.__child.stdout.read(count)
+            if output:
+                break
+            if self.__child.returncode is not None:
+                break
         logger.debug('Got %d bytes from stdout', len(output or ''))
-        if not output:
-            self.child.poll()
         return output
+
+    @property
+    def length(self):
+        return self._length
+
+
+class HTTPRange:
+
+    def __init__(self):
+        self.start = '0'
+        self.end = ''
+        self.size = ''
+
+    @classmethod
+    def from_string(class_, str_):
+        instance = class_()
+        if '/' in str_:
+            range_, instance.size = str_.split('/')
+        else:
+            range_ = str_
+        instance.start, instance.end = range_.split('-')
+        return instance
+
+    def __str__(self):
+        s = self.start + '-' + self.end
+        if self.size:
+            s += '/' + str(self.size)
+        return s
+
+class HTTPRangeField(dict):
+
+    @classmethod
+    def from_string(class_, str_):
+        instance = class_()
+        for forms_ in str_.split():
+            units, range_ = forms_.split('=')
+            instance[units] = HTTPRange.from_string(range_)
+        return instance
+
+    def __str__(self):
+        return ' '.join('{}={}'.format(units, range) for units, range in self.items())
 
 
 class ResourceRequestHandler:
@@ -476,44 +583,52 @@ class ResourceRequestHandler:
             ('Date', rfc1123_date()),
             ('Ext', ''),
             ('transferMode.dlna.org', 'Streaming'),
-            ('contentFeatures.dlna.org', CONTENT_FEATURES),
             # TODO: wtf does this mean?
-            ('realTimeInfo.dlna.org', 'DLNA.ORG_TLAG=*'),
-            ('Connnection', 'close')]
-        if 'range' in request:
-            units, range = request['range'].split('=', 1)
-            assert units == 'bytes', units
-            start, end = range.split('-', 1)
-            start = int(start) if start else 0
-            end = int(end) + 1 if end else None
-            resource = FileResource(path, start, end)
-            response_headers.extend([(
-                    'Content-Range',
-                    'bytes={:d}-{}/{:d}'.format(
-                        start,
-                        '' if end is None else self.end - 1,
-                        resource.size)
-                ), ('Content-Type', guess_mimetype(path)),
-                ('Accept-Ranges', 'bytes')])
-            if not end is None:
-                response_headers.append(
-                    ('Content-Length', str(end - start)))
-            del units, range, start, end
-        elif 'timeseekrange.dlna.org' in request:
-            units, range = request['timeseekrange.dlna.org'].split('=', 1)
-            start, end = range.split('-', 1)
-            resource = TranscodeResource(path, start, end)
-            response_headers.extend([(
-                    'TimeSeekRange.dlna.org',
-                    request['timeseekrange.dlna.org'] + '/*'
-                ), ('Content-type', 'video/mpeg')])
-            del units, range, start, end
+            #('realTimeInfo.dlna.org', 'DLNA.ORG_TLAG=*')
+        ]
+        content_features = DLNAContentFeatures()
+        if 'transcode' in request.query:
+            content_features.support_time_seek = True
+            content_features.transcoded = True
+            if TIMESEEKRANGE_DLNA_ORG in request:
+                ranges_field = HTTPRangeField.from_string(request[TIMESEEKRANGE_DLNA_ORG])
+            else:
+                ranges_field = HTTPRangeField({'npt': HTTPRange()})
+            npt_range = ranges_field['npt']
+            resource = TranscodeResource(path, npt_range.start, npt_range.end)
+            npt_range.size = '*'
+            if not resource.length:
+                npt_range.end = ''
+            response_headers += [
+                (TIMESEEKRANGE_DLNA_ORG, HTTPRangeField({'npt': npt_range})),
+                ('Content-type', 'video/mpeg'),
+                ('Connection', 'close')]
         else:
-            resource = TranscodeResource(path, '0', None)
+            content_features.support_range = True
+            if 'Range' in request:
+                ranges_field = HTTPRangeField.from_string(request['Range'])
+            else:
+                ranges_field = HTTPRangeField({'bytes': HTTPRange()})
+            bytes_range = ranges_field['bytes']
+            resource = FileResource(
+                path,
+                int(bytes_range.start) if bytes_range.start else 0,
+                int(bytes_range.end) + 1 if bytes_range.end else None)
+            bytes_range.size = resource.size
+            response_headers += [
+                ('Content-Range', HTTPRangeField({'bytes': bytes_range})),
+                ('Accept-Ranges', 'bytes'),
+                ('Content-Type', guess_mimetype(path))]
+            if resource.length:
+                response_headers += [('Content-Length', resource.length)]
+            else:
+                response_headers += [('Connection', 'close')]
+        response_headers += [(CONTENTFEATURES_DLNA_ORG, content_features)]
         self.resource = resource
         self.on_done = context.on_done
         self.socket = context.socket
         self.buffer = HTTPResponse(response_headers, code=206).to_bytes()
+        logging.debug('Response header:\n%s', self.buffer.decode())
 
     def __repr__(self):
         return '<{} len(buffer)={} resource={}>'.format(
@@ -530,10 +645,13 @@ class ResourceRequestHandler:
     def do_write(self):
         if not self.buffer:
             self.buffer = self.resource.read(0x20000)
-            if not self.buffer:
-                self.on_done(close=True)
-                return
-        self.buffer = self.buffer[self.socket.send(self.buffer):]
+        if self.buffer:
+            self.buffer = self.buffer[self.socket.send(self.buffer):]
+        else:
+            self.on_done(close=True)
+
+    def close(self):
+        self.resource.close()
 
 
 class SendBuffer:
@@ -553,6 +671,9 @@ class SendBuffer:
         self.buffer = self.buffer[self.socket.send(self.buffer):]
         if not self.buffer:
             self.on_done()
+
+    def close(self):
+        pass
 
 
 def soap_action_response(service_type, action_name, arguments):
@@ -584,74 +705,105 @@ def didl_lite(content):
 #objects.add_path('/media/data/towatch')
 #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
-def cd_object_xml(path, location, parent_id):
-    '''Returns a DIDL response object XML snippet'''
-    from xml.etree import ElementTree as etree
-    import os, os.path, urllib.parse
-    isdir = os.path.isdir(path)
-    element = etree.Element(
-        'container' if isdir else 'item',
-        id=path, parentID=parent_id, restricted='1')
-    if isdir:
-        element.set('childCount', str(len(os.listdir(path))))
-    etree.SubElement(element, 'dc:title').text = os.path.basename(path)
-    class_elt = etree.SubElement(element, 'upnp:class')
-    if isdir:
-        class_elt.text = 'object.container.storageFolder'
-    else:
-        class_elt.text = 'object.item.videoItem'
-    res_elt = etree.SubElement(element, 'res',
-        protocolInfo='http-get:*:{}:{}'.format(
-            guess_mimetype(path),
-            CONTENT_FEATURES))
-    scheme, netloc = location
-    res_elt.text = urllib.parse.urlunsplit((
-        scheme,
-        netloc,
-        RESOURCE_PATH,
-        urllib.parse.urlencode([('path', path)]),
-        None))
-    if not isdir:
-        res_elt.set('size', str(os.path.getsize(path)))
-        from metadata_ff import res_data
-        for attr, value in res_data(path).items():
-            res_elt.set(attr, str(value))
-    return etree.tostring(element, encoding='unicode')
+class ContentDirectoryService:
 
-def path_to_object_id(root_path, path):
-    # TODO prevent escaping root directory
-    path = os.path.normpath(path)
-    if path == root_path:
-        return '0'
-    else:
-        return path
+    def __init__(self, root_id_path, res_scheme, res_netloc):
+        self.root_id_path = root_id_path
+        self.res_scheme = res_scheme
+        self.res_netloc = res_netloc
 
-def object_id_to_path(root_path, object_id):
-    if object_id == '0':
-        return root_path
-    else:
-        return object_id
+    class list_dlna_dir:
+        def __init__(self, path):
+            self.path = path
+            self.entries = os.listdir(path)
+        def __len__(self):
+            return len(self.entries)
+        def __iter__(self):
+            for entry in sorted(self.entries):
+                entry_path = os.path.join(self.path, entry)
+                if os.path.isdir(entry_path):
+                    yield entry_path, entry, None
+                else:
+                    yield entry_path, entry, False
+                    yield entry_path, entry+'+transcode', True
 
-def cd_browse_result(root_path, location, **soap_args):
-    '''(list of CD objects in XML, total possible elements)'''
-    import os, os.path
-    path = object_id_to_path(root_path, soap_args['ObjectID'])
-    if soap_args['BrowseFlag'] == 'BrowseDirectChildren':
-        entries = sorted(os.listdir(path))
-        start = int(soap_args['StartingIndex'])
-        count = int(soap_args['RequestedCount'])
-        end = start + count if count else None
-        elements = []
-        for entry in entries[start:end]:
-            elements.append(cd_object_xml(
-                os.path.join(path, entry),
-                location,
-                soap_args['ObjectID']))
-        return elements, len(entries)
-    else:
-        parent_id = path_to_object_id(os.path.normpath(os.path.split(path)[0]))
-        return [cd_object_xml(path, location, parent_id)], 1
+    def object_xml(self, parent_id, path, title, transcode):
+        '''Returns XML describing a UPNP object'''
+        isdir = os.path.isdir(path)
+        element = etree.Element(
+            'container' if isdir else 'item',
+            id=path, parentID=parent_id, restricted='1')
+        if isdir:
+            element.set('childCount', str(len(self.list_dlna_dir(path))))
+        etree.SubElement(element, 'dc:title').text = title
+        class_elt = etree.SubElement(element, 'upnp:class')
+        if isdir:
+            class_elt.text = 'object.container.storageFolder'
+        else:
+            class_elt.text = 'object.item.videoItem'
+        content_features = DLNAContentFeatures()
+        if transcode:
+            content_features.support_time_seek = True
+            content_features.transcoded = True
+        else:
+            content_features.support_range = True
+        res_elt = etree.SubElement(element, 'res',
+            protocolInfo='http-get:*:{}:{}'.format(
+                '*' if isdir else guess_mimetype(path),
+                content_features))
+        res_elt.text = urllib.parse.urlunsplit((
+            self.res_scheme,
+            self.res_netloc,
+            RESOURCE_PATH,
+            urllib.parse.urlencode([('path', path)] + ([('transcode', '1')] if transcode else [])),
+            None))
+        if not isdir and not transcode:
+            res_elt.set('size', str(os.path.getsize(path)))
+            from metadata_ff import res_data
+            for attr, value in res_data(path).items():
+                res_elt.set(attr, str(value))
+        return etree.tostring(element, encoding='unicode')
 
+    def path_to_object_id(root_path, path):
+        # TODO prevent escaping root directory
+        path = os.path.normpath(path)
+        if path == root_path:
+            return '0'
+        else:
+            return path
+
+    def object_id_to_path(self, object_id):
+        if object_id == '0':
+            return self.root_id_path
+        else:
+            return object_id
+
+    def Browse(self, BrowseFlag, StartingIndex, RequestedCount, ObjectID, Filter, SortCriteria):
+        '''(list of CD objects in XML, total possible elements)'''
+        path = self.object_id_to_path(ObjectID)
+        if BrowseFlag == 'BrowseDirectChildren':
+            children = list(self.list_dlna_dir(path))
+            start = int(StartingIndex)
+            count = int(RequestedCount)
+            end = len(children)
+            if count:
+                end = min(start + count, end)
+            result_elements = []
+            for index in range(start, end):
+                child_path, title, transcode = children[index]
+                result_elements.append(self.object_xml(ObjectID, child_path, title, transcode))
+            total_matches = len(children)
+        else: # TODO check other flags
+            parent_id = path_to_object_id(os.path.normpath(os.path.split(path)[0]))
+            result_elements = [
+                self.object_xml(parent_id, path, '??ROOT??', None)
+            ]
+            total_matches = 1
+        logging.debug('ContentDirectory::Browse result:\n%s', pprint.pformat(result_elements))
+        return dict(
+            Result=xml_escape(didl_lite(''.join(result_elements))),
+            NumberReturned=len(result_elements),
+            TotalMatches=total_matches)
 
 class Soap:
 
@@ -667,6 +819,9 @@ class Soap:
         self.request = request
         self.socket = context.socket
         self.on_done = context.on_done
+
+    def close(self):
+        pass
 
     # TODO neatly report SOAP info
     #def __repr__(self):
@@ -724,17 +879,8 @@ class Soap:
             self.on_done()
 
     def soap_Browse(self, **soap_args):
-        from xml.sax.saxutils import escape
-        result, total_matches = cd_browse_result(
-            self.dms.path,
-            ('http', self.request['host']),
-            **soap_args)
-        return dict(
-                Result=escape(didl_lite(''.join(result))),
-                NumberReturned=len(result),
-                Totalmatches=total_matches,
-                #('UpdateID', 10)],
-            )
+        cds = ContentDirectoryService(self.dms.path, 'http', self.request['host'])
+        return cds.Browse(**soap_args)
 
     def soap_GetSortCapabilities(self, **soap_args):
         return {'SortCaps': 'dc:title'}
@@ -762,15 +908,7 @@ class SocketWrapper:
 
     def send(self, data):
         sent = self.__socket.send(data)
-        fmt = 'Sent %s bytes on %s to %s'
-        args = [sent, self.sockname, self.peername]
-        if sent <= 24 * 80:
-            fmt += ': %r'
-            args += [data[:sent]]
-            self.logger.debug(fmt, *args)
-        else:
-            self.logger.debug(fmt, *args)
-            self.logger.debug('%r', data[:sent])
+        self.logger.debug('%s sent %d bytes', self, sent)
         return sent
 
     def sendto(self, buf, addr):
@@ -1095,8 +1233,6 @@ def main():
     # import this AFTER logging config has been processed
     from pydlnadms import DigitalMediaServer
     DigitalMediaServer(opts.port, path)
-
-del logging
 
 if __name__ == '__main__':
     main()
