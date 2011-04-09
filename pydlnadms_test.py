@@ -5,3 +5,7 @@ class PydlnadmsTest(TestCase):
         import xml.etree.ElementTree as etree
         a = etree.Element('hi')
         self.assertEqual(type(etree.tostring(a)), str)
+
+if __name__ == '__main__':
+    import unittest
+    unittest.main()

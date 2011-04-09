@@ -2,16 +2,37 @@
 # filetype=python3
 
 import collections
+from xml.etree import ElementTree as etree
+import fcntl
 import getpass
 import heapq
 import logging # deleted at end of module
 import os
 import os.path
 import platform
+import pprint
 import select
 import socket
+import subprocess
+import sys
 import time
 import urllib.parse
+
+
+logger = logging.getLogger()
+
+
+# fix xml.etree.ElementTree.tostring for python < 3.2
+
+_etree_tostring_original = etree.tostring
+
+def _etree_tostring_wrapper(*args, **kwargs):
+    if kwargs['encoding'] == 'unicode':
+        del kwargs['encoding']
+    return _etree_tostring_original(*args, **kwargs)
+
+if sys.version_info.major <= 3 and sys.version_info.minor < 2:
+    etree.tostring = _etree_tostring_wrapper
 
 
 EXPIRY_FUDGE = 10
@@ -33,7 +54,8 @@ Service = collections.namedtuple(
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
 RESOURCE_PATH = '/res'
 # flags are in hex. trailing 24 zeroes, 26 are after the space
-CONTENT_FEATURES = 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
+# "DLNA.ORG_OP=" time-seek-range-supp bytes-range-header-supp
+CONTENT_FEATURES = 'DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
 SSDP_PORT = 1900
 SSDP_MCAST_ADDR = '239.255.255.250'
 
@@ -195,7 +217,8 @@ def rfc1123_date():
     return time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
 
 
-class RequestHandlerContext: pass
+class RequestHandlerContext:
+    __slots__ = 'socket', 'on_done', 'request', 'dms'
 
 
 class HTTPConnection:
@@ -230,7 +253,7 @@ class HTTPConnection:
             self.handler.do_write()
         except socket.error as exc:
             import errno
-            if exc.errno not in [errno.ENOTCONN, errno.EPIPE]:
+            if exc.errno not in [errno.ENOTCONN, errno.EPIPE, errno.ECONNRESET]:
                 raise
             self.logger.exception('Error during handler write')
             self.handler_done(close=True)
@@ -266,7 +289,12 @@ class HTTPConnection:
                 return
             del index
 
-            request = HTTPRequest.from_bytes(self.buffer)
+            try:
+                request = HTTPRequest.from_bytes(self.buffer)
+            except ValueError:
+                self.logger.exception('Failed to parse HTTP request')
+                self.close()
+                return
             self.logger.debug('Received HTTP request: %s', request)
             self.buffer = b''
             factory = self.handler_factory_new(request)
@@ -306,7 +334,7 @@ class HTTPConnection:
                 if request.path == service.SCPDURL:
                     return send_description(service.xmlDescription)
             if request.path == RESOURCE_PATH:
-                return Resource
+                return ResourceRequestHandler
         elif request.method in ['POST']:
             if request.path in (
                     service.controlURL for service in SERVICE_LIST):
@@ -370,88 +398,142 @@ class Server:
 
 
 def guess_mimetype(path):
+    return 'video/mpeg'
     from mimetypes import guess_type
     type = guess_type(path)[0]
     if type is None:
         type = 'application/octet-stream'
+    if type == 'video/MP2T':
+        type = 'video/mpeg'
     return type
     #return 'video/x-msvideo'
     #return 'video/MP2T'
 
 
-class Resource:
+class FileResource:
+
+    def __init__(self, path, start, end):
+        self.file = open(path, 'rb')
+        self.start = start
+        self.end = end
+        self.file.seek(start)
+
+    def read(self, count):
+        if self.end is not None:
+            count = min(self.end - self.file.tell(), count)
+        return self.file.read(count)
+
+    @property
+    def size(self):
+        return os.fstat(self.file.fileno()).st_size
+
+
+class TranscodeResource:
+
+    def __init__(self, path, start, end):
+        args = ['ffmpeg', '-i', path]
+        if start:
+            args += ['-ss', start]
+        if end:
+            args += ['-t', end]
+        args += [
+            '-vbsf', 'h264_mp4toannexb',
+            '-vcodec', 'copy',
+            '-acodec', 'copy',
+            '-scodec', 'copy',
+            '-f', 'mpegts',
+            '-y', '/dev/stdout']
+        self.child = subprocess.Popen(
+            args,
+            stdin=open(os.devnull, 'rb'),
+            stdout=subprocess.PIPE,)
+            #stderr=subprocess.PIPE)
+        def set_non_blocking(fd):
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK|flags)
+        #set_non_blocking(self.child.stderr)
+        #set_non_blocking(self.child.stdout)
+
+    def read(self, count):
+        #stderr_output = self.child.stderr.read()
+        #logger.debug('Got %d bytes from stderr', len(stderr_output or ''))
+        #if stderr_output:
+            #logger.info('Transcoder diagnostic: %s', stderr_output)
+        output = self.child.stdout.read(count)
+        logger.debug('Got %d bytes from stdout', len(output or ''))
+        if not output:
+            self.child.poll()
+        return output
+
+
+class ResourceRequestHandler:
 
     def __init__(self, context):
-        self.on_done = context.on_done
         request = context.request
-        units, range = request['range'].split('=', 1)
-        assert units == 'bytes', units
-        start, end = range.split('-', 1)
-        self.start = int(start) if start else 0
-        self.end = int(end) + 1 if end else None
-        del start, end, units, range
-        self.path = request.query['path'][-1]
-        try:
-            self.file = open(self.path, 'rb')
-        except IOError as exc:
-            if exc.errno == errno.ENOENT:
-                logger.exception('Error in resource request handler')
-            self.on_done(close=True)
-        import os
-        size = os.fstat(self.file.fileno()).st_size
-        if self.end is None:
-            # TODO: do we have to determine the end of the stream?
-            self.end = size
-            #pass
-        else:
-            self.end = min(self.end, size)
-        self.file.seek(self.start)
-        self.socket = context.socket
-        headers = [
+        path = request.query['path'][-1]
+        response_headers = [
             ('Server', SERVER_FIELD),
             ('Date', rfc1123_date()),
             ('Ext', ''),
             ('transferMode.dlna.org', 'Streaming'),
-            ('Content-Type', guess_mimetype(self.path)),
             ('contentFeatures.dlna.org', CONTENT_FEATURES),
-            ('Content-Range', 'bytes {:d}-{}/{:d}'.format(
-                self.start,
-                '' if self.end is None else self.end - 1,
-                size)),
             # TODO: wtf does this mean?
             ('realTimeInfo.dlna.org', 'DLNA.ORG_TLAG=*'),
-            ('Accept-Ranges', 'bytes'),]
-        if self.end is None:
-            headers.append(('Connection', 'close'))
+            ('Connnection', 'close')]
+        if 'range' in request:
+            units, range = request['range'].split('=', 1)
+            assert units == 'bytes', units
+            start, end = range.split('-', 1)
+            start = int(start) if start else 0
+            end = int(end) + 1 if end else None
+            resource = FileResource(path, start, end)
+            response_headers.extend([(
+                    'Content-Range',
+                    'bytes={:d}-{}/{:d}'.format(
+                        start,
+                        '' if end is None else self.end - 1,
+                        resource.size)
+                ), ('Content-Type', guess_mimetype(path)),
+                ('Accept-Ranges', 'bytes')])
+            if not end is None:
+                response_headers.append(
+                    ('Content-Length', str(end - start)))
+            del units, range, start, end
+        elif 'timeseekrange.dlna.org' in request:
+            units, range = request['timeseekrange.dlna.org'].split('=', 1)
+            start, end = range.split('-', 1)
+            resource = TranscodeResource(path, start, end)
+            response_headers.extend([(
+                    'TimeSeekRange.dlna.org',
+                    request['timeseekrange.dlna.org'] + '/*'
+                ), ('Content-type', 'video/mpeg')])
+            del units, range, start, end
         else:
-            headers.append(('Content-Length', str(self.end - self.start)))
-        self.buffer = HTTPResponse(headers, code=206).to_bytes()
+            resource = TranscodeResource(path, '0', None)
+        self.resource = resource
+        self.on_done = context.on_done
+        self.socket = context.socket
+        self.buffer = HTTPResponse(response_headers, code=206).to_bytes()
 
     def __repr__(self):
-        return '<{} path={}, range={}-{}, len(buffer)={}>'.format(
+        return '<{} len(buffer)={} resource={}>'.format(
             self.__class__.__name__,
-            self.path,
-            self.start, self.end,
-            len(self.buffer))
+            len(self.buffer),
+            self.resource)
 
     def need_read(self):
         return False
 
     def need_write(self):
-        return self.buffer or self.end is None or self.file.tell() < self.end
+        return True
 
     def do_write(self):
         if not self.buffer:
-            bufsize = 0x20000 # 128Ki
-            if self.end is not None:
-                bufsize = min(bufsize, self.end - self.file.tell())
-            self.buffer = self.file.read(bufsize)
+            self.buffer = self.resource.read(0x20000)
             if not self.buffer:
-                self.on_done()
-        if self.buffer:
-            self.buffer = self.buffer[self.socket.send(self.buffer):]
-        if not self.need_write():
-            self.on_done()
+                self.on_done(close=True)
+                return
+        self.buffer = self.buffer[self.socket.send(self.buffer):]
 
 
 class SendBuffer:
@@ -534,7 +616,7 @@ def cd_object_xml(path, location, parent_id):
         from metadata_ff import res_data
         for attr, value in res_data(path).items():
             res_elt.set(attr, str(value))
-    return etree.tostring(element)
+    return etree.tostring(element, encoding='unicode')
 
 def path_to_object_id(root_path, path):
     # TODO prevent escaping root directory
@@ -926,7 +1008,7 @@ class DigitalMediaServer:
             channels = [self.http_server] + self.ssdp.channels + self.http_conns
             readset =  [chan for chan in channels if chan.need_read()]
             writeset = [chan for chan in channels if chan.need_write()]
-            self.logger.debug('Selecting on channels: %s', channels)
+            self.logger.debug('Selecting on channels:\n%s', pprint.pformat(channels))
             for chan in channels:
                 assert chan in readset or chan in writeset, chan
 
@@ -998,10 +1080,9 @@ def main():
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)
     else:
-        logging.config.fileConfig(opts.logging_conf)
+        logging.config.fileConfig(opts.logging_conf, disable_existing_loggers=False)
     logger = logging.getLogger('pydlnadms.main')
     logger.debug('Parsed opts=%r args=%r', opts, args)
-    del logging
 
     if len(args) == 0:
         path = os.curdir
