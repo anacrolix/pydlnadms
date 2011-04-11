@@ -37,7 +37,7 @@ def res_data(path):
                 return
             tag, value = map(str.strip, line.split('=', 1))
             assert tag not in data
-            print(tag, value)
+            #print(tag, value)
             if value != 'N/A':
                 data[tag] = value
     for line in pusher:
