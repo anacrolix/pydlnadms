@@ -981,12 +981,15 @@ class SSDP:
         return self.dms.notify_interval * 2 + EXPIRY_FUDGE
 
     def send_msearch_reply(self, sockaddr, peeraddr, st):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(peeraddr)
+        sock = SocketWrapper(sock)
         buf = HTTPResponse([
                 ('CACHE-CONTROL', 'max-age={:d}'.format(self.max_age)),
                 ('DATE', rfc1123_date()),
                 ('EXT', ''),
                 ('LOCATION', 'http://{}:{:d}{}'.format(
-                    sockaddr[0],
+                    sock.getsockname()[0],
                     self.http_address[1],
                     ROOT_DESC_PATH)),
                 ('SERVER', SERVER_FIELD),
@@ -994,7 +997,8 @@ class SSDP:
                 ('USN', self.usn_from_target(st))
             ], code=200
         ).to_bytes()
-        self.receiver.sendto(buf, peeraddr)
+        sock.send(buf)
+        sock.close()
         self.logger.debug('Responded to M-SEARCH from %s', peeraddr)
 
 
