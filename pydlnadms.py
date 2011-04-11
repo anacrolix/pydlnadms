@@ -32,7 +32,7 @@ logger = logging.getLogger()
 _etree_tostring_original = etree.tostring
 
 def _etree_tostring_wrapper(*args, **kwargs):
-    if kwargs['encoding'] == 'unicode':
+    if kwargs.get('encoding') == 'unicode':
         del kwargs['encoding']
     return _etree_tostring_original(*args, **kwargs)
 
@@ -613,7 +613,7 @@ class ResourceRequestHandler:
                             self.socket.peername,
                             self.resource)
                         return False
-                self.buffer = self.resource.read(0x1000)
+                self.buffer = self.resource.read(0x20000)
             return self.resource.length
         finally:
             self.resource.close()
