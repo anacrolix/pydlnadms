@@ -3,6 +3,7 @@
 
 import collections
 import datetime
+import errno
 from xml.etree import ElementTree as etree
 import fcntl
 import http.client
@@ -14,6 +15,7 @@ import os.path
 import platform
 import pprint
 import queue
+import random
 import select
 import socket
 import subprocess
@@ -24,7 +26,7 @@ import urllib.parse
 from xml.sax.saxutils import escape as xml_escape
 
 
-logger = logging.getLogger()
+logger = logging.getLogger('pydlnadms')
 
 
 # fix xml.etree.ElementTree.tostring for python < 3.2
@@ -40,11 +42,16 @@ if sys.version_info.major <= 3 and sys.version_info.minor < 2:
     etree.tostring = _etree_tostring_wrapper
 
 
+def pretty_sockaddr(addr):
+    assert len(addr) == 2, addr
+    return '{}:{:d}'.format(addr[0], addr[1])
+
+
 EXPIRY_FUDGE = 10
 UPNP_ROOT_DEVICE = 'upnp:rootdevice'
 UPNP_DOMAIN_NAME = 'schemas-upnp-org'
 ROOT_DESC_PATH = '/rootDesc.xml'
-SERVER_FIELD = '{}/{} DLNADOC/1.50 UPnP/1.0 MiniDLNA/1.0'.format(
+SERVER_FIELD = '{}/{} DLNADOC/1.50 UPnP/1.0 PyDLNADMS/1.0'.format(
     *platform.linux_distribution()[0:2])
 ROOT_DEVICE_DEVICE_TYPE = 'urn:schemas-upnp-org:device:MediaServer:1'
 ROOT_DEVICE_FRIENDLY_NAME = 'pydlnadms: {!r} on {!r}'.format(
@@ -53,7 +60,6 @@ ROOT_DEVICE_FRIENDLY_NAME = 'pydlnadms: {!r} on {!r}'.format(
 ROOT_DEVICE_MANUFACTURER = 'Matt Joiner'
 ROOT_DEVICE_MODEL_NAME = 'pydlnadms 0.1'
 DEVICE_DESC_SERVICE_FIELDS = 'serviceType', 'serviceId', 'SCPDURL', 'controlURL', 'eventSubURL'
-CONTENT_DIRECTORY_CONTROL_URL = '/ctl/ContentDirectory'
 Service = collections.namedtuple(
     'Service',
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
@@ -147,7 +153,7 @@ def http_message(first_line, headers, body):
     return (first_line + '\r\n' + httpify_headers(headers) + '\r\n').encode('utf-8') + body
 
 
-class Message:
+class HTTPMessage:
 
     def __init__(self, first_line, headers, body):
         self.first_line = first_line
@@ -187,7 +193,7 @@ class HTTPRequest:
         return key.upper() in self.headers
 
     def to_bytes(self):
-        return Message(
+        return HTTPMessage(
             ' '.join((self.method, self.path, 'HTTP/1.1')),
             self.headers,
             self.body).to_bytes()
@@ -219,7 +225,7 @@ class HTTPResponse:
         self.reason = reason
 
     def to_bytes(self):
-        return Message(
+        return HTTPMessage(
             'HTTP/1.1 {:03d} {}'.format(
                 self.code,
                 self.reason or self.responses[self.code]),
@@ -270,7 +276,13 @@ class HTTPConnection:
             data = self.socket.recv(bufsize)
             assert data == peek_data[:bufsize], (data, peek_data)
             if not data:
-                raise Exception('Peer closed connection')
+                if buffer:
+                    self.logger.error('Received incompleted HTTP request')
+                else:
+                    self.logger.info(
+                        'Peer closed connection from %s',
+                        pretty_sockaddr(self.socket.peername))
+                return None
             buffer += data
             del data, bufsize, peek_data
 
@@ -287,17 +299,32 @@ class HTTPConnection:
             self.logger.debug('Received HTTP request:\n%s', buffer.decode('utf-8'))
             del buffer
             return request
+        assert False
 
     def run(self):
         try:
             while True:
-                request = self.read_request()
-                factory = self.handler_factory_new(request)
                 context = RequestHandlerContext()
                 context.socket = self.socket
-                context.request = request
                 context.dms = self.dms
-                handler = factory(context=context)
+                try:
+                    context.request = self.read_request()
+                    if context.request is None:
+                        return
+                    factory = self.handler_factory_new(context.request)
+                except self.HTTPException as exc:
+                    buffer = HTTPResponse([
+                            ('Content-Length', 0),
+                            ('Date', rfc1123_date()),
+                            ('SERVER', SERVER_FIELD),
+                        ], code=exc.args[0]).to_bytes()
+                    self.logger.debug(
+                        'Response to %s:\n%s',
+                        pretty_sockaddr(context.socket.peername),
+                        buffer.decode())
+                    handler = SendBuffer(buffer, context)
+                else:
+                    handler = factory(context=context)
                 if not handler.run():
                     break
         finally:
@@ -336,15 +363,20 @@ class HTTPConnection:
                 return soap_action()
             return None
         elif request.method in ['SUBSCRIBE']:
-            return None
-        assert False, (request.method, request.path)
+            for service in SERVICE_LIST:
+                if request.path == service.eventSubURL:
+                    raise self.HTTPException(http.client.NOT_IMPLEMENTED)
+            else:
+                raise self.HTTPException(http.client.NOT_FOUND)
+        else:
+            raise self.HTTPException(http.client.NOT_IMPLEMENTED)
 
 
 class HTTPServer:
 
-    logger = logging.getLogger('http.server')
+    logger = logger
 
-    def __init__(self, port, master):
+    def __init__(self, port, on_accept):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         # TODO allow binding to specific interfaces
@@ -352,38 +384,27 @@ class HTTPServer:
             try:
                 self.socket.bind(('', port))
             except socket.error as exc:
-                if exc.errno != 98:
+                if exc.errno != errno.EADDRINUSE:
                     raise
             else:
-                self.logger.info(
-                    'HTTP server listening on %s',
-                    self.socket.getsockname())
+                self.logger.info('HTTP server listening on %s', pretty_sockaddr(self.socket.getsockname()))
                 break
             port += 1
         # TODO use the socket backlog default
         self.socket.listen(5)
-        self.master = master
+        self.on_accept = on_accept
 
-    def need_read(self):
-        return True
-
-    def need_write(self):
-        return False
-
-    def fileno(self):
-        return self.socket.fileno()
-
-    def do_read(self):
-        sock, addr = self.socket.accept()
-        self.logger.debug('Accepted connection from %s', addr)
-        self.master.on_server_accept(sock)
+    def run(self):
+        while True:
+            sock, addr = self.socket.accept()
+            self.logger.info('Accepted connection from %s', pretty_sockaddr(addr))
+            self.on_accept(sock)
 
     def __repr__(self):
-        return '<{}.{} socket={} master={}>'.format(
+        return '<{}.{} socket={}>'.format(
             self.__class__.__module__,
             self.__class__.__name__,
-            self.socket,
-            self.master)
+            self.socket)
 
 
 def guess_mimetype(path):
@@ -420,7 +441,7 @@ class FileResource:
         return (self.size if self.end is None else min(self.size, self.end)) - self.start
 
     def __repr__(self):
-        return '<FileResource path=%r>' % self.file.name
+        return '<FileResource path=%r, start=%r, end=%r>' % (self.file.name, self.start, self.end)
 
     def close(self):
         logging.debug('Closing %r', self)
@@ -462,7 +483,7 @@ class TranscodeResource:
             #~ '-copyts',
             '-f', 'mpegts',
             '-y', '/dev/stdout']
-        logging.info('Starting transcoder: %r', args)
+        logging.debug('Starting transcoder: %r', args)
         self.__child = subprocess.Popen(
             args,
             stdin=open(os.devnull, 'rb'),
@@ -491,7 +512,7 @@ class TranscodeResource:
             if not output:
                 break
             self.logger.debug('Output on stderr: %r\n%s', self, output.decode('utf-8'))
-        self.logger.info('Stderr ended: %r', self)
+        self.logger.debug('Stderr ended: %r', self)
 
     def read(self, count):
         output = self.__child.stdout.read(count)
@@ -606,13 +627,14 @@ class ResourceRequestHandler:
                 while self.buffer:
                     try:
                         self.buffer = self.buffer[self.socket.send(self.buffer):]
-                    except:
-                        logging.exception(
-                            'Error sending %d bytes to %s: %r',
-                            len(self.buffer),
-                            self.socket.peername,
-                            self.resource)
-                        return False
+                    except socket.error as exc:
+                        if exc.errno in [errno.EPIPE]:
+                            logging.info(
+                                'Connection with %s closed by peer during handler: %r',
+                                pretty_sockaddr(self.socket.peername),
+                                self.resource)
+                            return False
+                        raise
                 self.buffer = self.resource.read(0x20000)
             return self.resource.length
         finally:
@@ -667,10 +689,15 @@ class ContentDirectoryService:
         self.res_scheme = res_scheme
         self.res_netloc = res_netloc
 
+    # TODO remove this, so I can do fancier and faster shit with mimetypes and transcoding
     class list_dlna_dir:
         def __init__(self, path):
             self.path = path
-            self.entries = os.listdir(path)
+            try:
+                self.entries = os.listdir(path)
+            except:
+                logger.warning('Error listing directory: %s', sys.exc_info()[1])
+                self.entries = []
         def __len__(self):
             return len(self.entries)
         def __iter__(self):
@@ -688,8 +715,8 @@ class ContentDirectoryService:
         element = etree.Element(
             'container' if isdir else 'item',
             id=path, parentID=parent_id, restricted='1')
-        if isdir:
-            element.set('childCount', str(len(self.list_dlna_dir(path))))
+        #if isdir:
+        #    element.set('childCount', str(len(self.list_dlna_dir(path))))
         etree.SubElement(element, 'dc:title').text = title
         class_elt = etree.SubElement(element, 'upnp:class')
         if isdir:
@@ -894,17 +921,25 @@ class SocketWrapper:
             self.peername,)
 
 
-class SSDP:
+class SSDPAdvertiser:
 
-    logger = logging.getLogger('ssdp')
+    logger = logger
 
     def __init__(self, dms):
-        self.receiver = SSDPReceiver(self)
         self.dms = dms
+        self.events = Events()
 
     @property
-    def channels(self):
-        return [self.receiver]
+    def http_address(self):
+        return self.dms.http_server.socket.getsockname()
+
+    @property
+    def usn_from_target(self):
+        return self.dms.usn_from_target
+
+    @property
+    def notify_interval(self):
+        return self.dms.notify_interval
 
     @property
     def notify_interfaces(self):
@@ -915,14 +950,14 @@ class SSDP:
                 yield ifaddr.family, ifaddr.addr
 
     def ssdp_multicast(self, family, addr, buf):
-        from socket import socket, SOCK_DGRAM, IPPROTO_IP, IP_MULTICAST_LOOP
-        s = socket(family, SOCK_DGRAM)
-        s.setsockopt(IPPROTO_IP, IP_MULTICAST_LOOP, False)
-        s.bind((addr[0], 0))
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
+        s.bind((addr[0], 0)) # to the interface on any port
         s = SocketWrapper(s)
         s.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
+        s.close()
 
-    def send_goodbye(self):
+    def notify_byebye(self):
         for nt in self.dms.all_targets:
             for family, addr in self.notify_interfaces:
                 buf = HTTPRequest('NOTIFY', '*', (
@@ -933,11 +968,11 @@ class SSDP:
                 self.ssdp_multicast(family, addr, buf)
         self.logger.debug('Sent SSDP byebye notifications')
 
-    def send_notify(self):
+    def notify_alive(self):
         # TODO for each interface
         # sends should also be delayed 100ms by eventing
-        for nt in self.dms.all_targets:
-            for family, addr in self.notify_interfaces:
+        for family, addr in self.notify_interfaces:
+            for nt in self.dms.all_targets:
                 buf = HTTPRequest('NOTIFY', '*', [
                     ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
                     ('CACHE-CONTROL', 'max-age={:d}'.format(
@@ -950,12 +985,28 @@ class SSDP:
                     ('NTS', 'ssdp:alive'),
                     ('SERVER', SERVER_FIELD),
                     ('USN', self.usn_from_target(nt))]).to_bytes()
-                self.ssdp_multicast(family, addr, buf)
-        self.logger.debug('Sent SSDP alive notifications')
+                self.events.add(
+                    self.ssdp_multicast,
+                    args=[family, addr, buf],
+                    delay=random.uniform(0, 0.1))
+            self.logger.info('Sending SSDP alive notifications from %s', addr[0])
+        self.events.add(self.notify_alive, delay=self.notify_interval)
 
-    def process_request(self, data, peeraddr, sockaddr):
+    def run(self):
+        self.events.add(self.notify_alive, delay=0.1)
+        while True:
+            timeout = self.events.poll()
+            logger.debug('Waiting for next advertisement event: %r', timeout)
+            time.sleep(timeout)
+
+class SSDPResponder:
+
+    logger = logger
+
+    def process_message(self, data, peeraddr):
         request = HTTPRequest.from_bytes(data)
         if request.method != 'M-SEARCH':
+            logging.info('Ignoring %r request from %s', request.method, peeraddr)
             return
         st = request['st']
         if st in self.dms.all_targets:
@@ -963,24 +1014,28 @@ class SSDP:
         elif st == 'ssdp:all':
             sts = self.dms.all_targets
         else:
-            self.logger.debug('Ignoring M-SEARCH for %r', st)
+            self.logger.debug('Ignoring M-SEARCH for %r from %s', st, peeraddr[0])
             return
         for st in sts:
-            self.send_msearch_reply(sockaddr, peeraddr, st)
-
-    @property
-    def http_address(self):
-        return self.dms.http_server.socket.getsockname()
+            self.send_msearch_reply(peeraddr, st)
+            self.events.add(
+                self.send_msearch_reply,
+                args=[peeraddr, st],
+                delay=random.uniform(1, float(request['MX'])))
 
     @property
     def usn_from_target(self):
         return self.dms.usn_from_target
 
     @property
+    def http_address(self):
+        return self.dms.http_server.socket.getsockname()
+
+    @property
     def max_age(self):
         return self.dms.notify_interval * 2 + EXPIRY_FUDGE
 
-    def send_msearch_reply(self, sockaddr, peeraddr, st):
+    def send_msearch_reply(self, peeraddr, st):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.connect(peeraddr)
         sock = SocketWrapper(sock)
@@ -999,12 +1054,9 @@ class SSDP:
         ).to_bytes()
         sock.send(buf)
         sock.close()
-        self.logger.debug('Responded to M-SEARCH from %s', peeraddr)
+        self.logger.debug('Responded to M-SEARCH from %s', pretty_sockaddr(peeraddr))
 
-
-class SSDPReceiver(SocketWrapper):
-
-    def __init__(self, master):
+    def __init__(self, dms):
         import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
@@ -1016,20 +1068,16 @@ class SSDPReceiver(SocketWrapper):
             socket.inet_aton('0.0.0.0'),
             0)
         s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreqn)
-        super().__init__(s)
-        self.master = master
+        self.socket = SocketWrapper(s)
+        self.events = Events()
+        self.dms = dms
 
-    def need_read(self):
-        return True
-
-    def need_write(self):
-        return False
-
-    def do_read(self):
-        # MTU should limit UDP packet sizes to well below this
-        data, addr = self.recvfrom(0x1000)
-        assert len(data) < 0x1000, len(addr)
-        self.master.process_request(data, addr, self.getsockname())
+    def run(self):
+        while True:
+            # MTU should limit UDP packet sizes to well below this
+            data, addr = self.socket.recvfrom(0x1000)
+            assert len(data) < 0x1000, len(addr)
+            self.process_message(data, addr)
 
 
 def make_device_desc(udn):
@@ -1060,77 +1108,62 @@ def make_device_desc(udn):
     return tostring(root, encoding='utf-8')#.encode('utf-8')
 
 
+class Events:
+
+    def __init__(self):
+        self.events = []
+
+    def add(self, callback, args=None, delay=None):
+        heapq.heappush(self.events, (time.time() + delay, callback, args))
+
+    def poll(self):
+        # execute any events that've passed their due times
+        while True:
+            if self.events:
+                timeout = self.events[0][0] - time.time()
+                if timeout >= 0:
+                    # event not ready, so return the timeout
+                    return timeout
+                # event ready, execute it
+                callback, args = heapq.heappop(self.events)[1:]
+                callback(*([] if args is None else args))
+            else:
+                # no events pending, so there is no timeout
+                return None
+
+
 class DigitalMediaServer:
 
-    logger = logging.getLogger('pydlnadms')
-
     def __init__(self, port, path):
-        self.ssdp = SSDP(self)
-        # TODO there is much more to it than this
+        # use a hash of the friendly name (should be unique enough)
         self.device_uuid = 'uuid:deadbeef-0000-0000-0000-{}'.format(
             '{:012x}'.format(abs(hash(ROOT_DEVICE_FRIENDLY_NAME)))[-12:])
-        self.logger.info('UUID is %r', self.device_uuid)
+        logger.info('DMS UUID is %r', self.device_uuid)
         self.notify_interval = 895
         self.device_desc = make_device_desc(self.device_uuid)
-        self.http_server = HTTPServer(port, self)
-        self.http_conns = []
-        self.events = []
+        self.http_server = HTTPServer(port, self.on_server_accept)
+        self.ssdp_advertiser = SSDPAdvertiser(self)
+        self.ssdp_responder = SSDPResponder(self)
         self.path = path
-        self.add_event(0, self.ssdp.send_goodbye)
-        self.add_event(2, self.advertise)
         self.run()
 
     def run(self):
+        threads = []
+        for runnable in [self.http_server, self.ssdp_advertiser, self.ssdp_responder]:
+            thread = threading.Thread(target=runnable.run, name=runnable.__class__.__name__)
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
         while True:
-            # execute any events who've passed their due times
-            while True:
-                if self.events:
-                    timeout = self.events[0][0] - time.time()
-                    if timeout >= 0:
-                        # event not ready, so set the timeout
-                        break
-                    # event ready, execute it
-                    heapq.heappop(self.events)[1]()
-                else:
-                    # no events pending, so there is no timeout
-                    timeout = None
-                    break
-                del timeout
-
-            channels = [self.http_server] + self.ssdp.channels + self.http_conns
-            readset =  [chan for chan in channels if chan.need_read()]
-            writeset = [chan for chan in channels if chan.need_write()]
-            self.logger.debug('Selecting on channels:\n%s', pprint.pformat(channels))
-            for chan in channels:
-                assert chan in readset or chan in writeset, chan
-
-            self.logger.debug('Polling with timeout: %s', timeout)
-            readset, writeset, exptset = select.select(
-                readset, writeset, channels, timeout)
-            assert not exptset, exptset # never had reason to get exception yet
-            if not any((readset, writeset, exptset)):
-                # why should this happen? signal?
-                self.logger.info('Select returned no events!')
-            else:
-                for chan in readset:
-                    self.logger.debug('Read event occurred: %s', chan)
-                for chan in writeset:
-                    self.logger.debug('Write event occurred: %s', chan)
-            for chan in readset:
-                chan.do_read()
-            for chan in writeset:
-                chan.do_write()
-
-    def add_event(self, delay, callback):
-        heapq.heappush(self.events, (time.time() + delay, callback))
-
-    def advertise(self):
-        self.ssdp.send_notify()
-        self.add_event(self.notify_interval, self.advertise)
+            for thread in threads:
+                thread.join(0.33)
+                if not thread.is_alive():
+                    logger.warning('A required thread has terminated: %r', thread)
+                    return
 
     def on_server_accept(self, sock):
         blah = HTTPConnection(SocketWrapper(sock), self)
-        thread = threading.Thread(target=blah.run)
+        thread = threading.Thread(target=blah.run, name=blah)
         thread.daemon = True
         thread.start()
 
@@ -1178,25 +1211,16 @@ def main():
     logger.debug('Parsed opts=%r args=%r', opts, args)
 
     if len(args) == 0:
-        path = os.curdir
+        #path = os.curdir
+        # TODO test this on non-unix systems
+        path = '/'
     elif len(args) == 1:
         path = args[0]
     else:
         parser.error('Only one path is allowed')
     path = os.path.normpath(path)
 
-    # import this AFTER logging config has been processed
-    from pydlnadms import DigitalMediaServer
     DigitalMediaServer(opts.port, path)
 
 if __name__ == '__main__':
     main()
-
-#if __name__ == '__main__':
-    #class Master:
-        #def process_request(self, buf, peeraddr, sockaddr):
-            #print(buf, peeraddr, sockaddr)
-    #master = Master()
-    #sr = SSDPReceiver(master)
-    #while True:
-        #sr.do_read()
