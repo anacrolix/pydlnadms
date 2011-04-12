@@ -311,7 +311,7 @@ class HTTPConnection:
                     context.request = self.read_request()
                     if context.request is None:
                         return
-                    factory = self.handler_factory_new(context.request)
+                    handler = self.create_handler(context.request.method, context.request.path)
                 except self.HTTPException as exc:
                     buffer = HTTPResponse([
                             ('Content-Length', 0),
@@ -322,54 +322,44 @@ class HTTPConnection:
                         'Response to %s:\n%s',
                         pretty_sockaddr(context.socket.peername),
                         buffer.decode())
-                    handler = SendBuffer(buffer, context)
-                else:
-                    handler = factory(context=context)
-                if not handler.run():
+                    handler = BufferRequestHandler(buffer)
+                # return true if another request can now be handled
+                if not handler.handle(context):
                     break
         finally:
             self.socket.close()
 
-    def handler_factory_new(self, request):
-        '''Returns None if the request cannot be handled. Otherwise returns a callable that takes a request context.'''
-        def send_buffer(buf):
-            return functools.partial(SendBuffer, buf)
-        def soap_action():
-            return SOAPRequestHandler
+    def create_handler(self, method, path):
         def send_description(desc):
-            import functools
-            return functools.partial(
-                SendBuffer,
-                buffer=HTTPResponse([
-                        ('CONTENT-LENGTH', str(len(desc))),
-                        ('CONTENT-TYPE', 'text/xml'),
-                        ('DATE', rfc1123_date())
-                    ], desc, code=200).to_bytes())
-        def send_error(code):
-            return send_buffer(http_response(code=code))
-        if request.method in ['GET']:
-            if request.path == ROOT_DESC_PATH:
+            return BufferRequestHandler(HTTPResponse([
+                    ('CONTENT-LENGTH', str(len(desc))),
+                    ('CONTENT-TYPE', 'text/xml'),
+                    ('DATE', rfc1123_date()),
+                    ('SERVER', SERVER_FIELD),
+                ], desc, code=200).to_bytes())
+        if method in ['GET']:
+            if path == ROOT_DESC_PATH:
                 return send_description(self.dms.device_desc)
             for service in SERVICE_LIST:
-                if request.path == service.SCPDURL:
+                if path == service.SCPDURL:
                     return send_description(service.xmlDescription)
-            if request.path in [RESOURCE_PATH, ICON_PATH]:
-                return ResourceRequestHandler
+            if path in [RESOURCE_PATH, ICON_PATH]:
+                return ResourceRequestHandler()
             else:
                 raise self.HTTPException(http.client.NOT_FOUND)
-        elif request.method in ['POST']:
-            if request.path in (
-                    service.controlURL for service in SERVICE_LIST):
-                return soap_action()
-            return None
-        elif request.method in ['SUBSCRIBE']:
+        elif method in ['POST']:
+            if path in (service.controlURL for service in SERVICE_LIST):
+                return SOAPRequestHandler()
+            raise self.HTTPException(http.client.NOT_FOUND)
+        elif method in ['SUBSCRIBE']:
             for service in SERVICE_LIST:
-                if request.path == service.eventSubURL:
+                if path == service.eventSubURL:
                     raise self.HTTPException(http.client.NOT_IMPLEMENTED)
             else:
                 raise self.HTTPException(http.client.NOT_FOUND)
         else:
             raise self.HTTPException(http.client.NOT_IMPLEMENTED)
+        assert False
 
 
 class HTTPServer:
@@ -467,6 +457,7 @@ class TranscodeResource:
             self.__child.pid,
             self.__child.returncode)
 
+    # todo, create the child in the run function
     def __init__(self, path, start, end):
         args = ['ffmpeg', '-i', path]
         if start:
@@ -475,6 +466,7 @@ class TranscodeResource:
             args += ['-t', str(dlna_npt_sec(end) - dlna_npt_sec(start))]
         args += [
             '-target', 'pal-dvd',
+            #~ '-threads', '4',
             #~ '-vbsf', 'h264_mp4toannexb',
             #~ '-vcodec', 'copy',
             #~ '-acodec', 'copy',
@@ -490,7 +482,7 @@ class TranscodeResource:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-            #~ bufsize=0x40000
+            #~ bufsize=0x40000,
         )
         #~ flags = fcntl.fcntl(self.__child.stdout, fcntl.F_GETFL)
         #~ fcntl.fcntl(self.__child.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -498,6 +490,12 @@ class TranscodeResource:
         thread.daemon = True
         thread.start()
         self.args = args
+
+    def fileno(self):
+        return self.__child.stdout.fileno()
+
+    def __del__(self):
+        assert self.__child.returncode is not None
 
     def close(self):
         self.__child.stdout.close()
@@ -507,12 +505,9 @@ class TranscodeResource:
         logging.debug('Transcoder process terminated: %r', self)
 
     def _log_stderr(self):
-        while True:
-            output = self.__child.stderr.read(0x1000)
-            if not output:
-                break
-            self.logger.debug('Output on stderr: %r\n%s', self, output.decode('utf-8'))
-        self.logger.debug('Stderr ended: %r', self)
+        for line in self.__child.stderr:
+            self.logger.debug('Transcoder output on stderr: %r\n%s', self, line)
+        self.logger.debug('EOF on transcoder stderr: %r', self)
 
     def read(self, count):
         output = self.__child.stdout.read(count)
@@ -547,6 +542,7 @@ class HTTPRange:
             s += '/' + str(self.size)
         return s
 
+
 class HTTPRangeField(dict):
 
     @classmethod
@@ -563,13 +559,18 @@ class HTTPRangeField(dict):
 
 class ResourceRequestHandler:
 
-    def __init__(self, context):
-        request = context.request
+    def __repr__(self):
+        return '<{} len(buffer)={} resource={}>'.format(
+            self.__class__.__name__,
+            len(self.buffer),
+            self.resource)
+
+    def start_response(self, request):
         path = request.query['path'][-1]
         response_headers = [
             ('Server', SERVER_FIELD),
             ('Date', rfc1123_date()),
-            ('Ext', ''),
+            ('Ext', None),
             ('transferMode.dlna.org', 'Streaming'),
             # TODO: wtf does this mean?
             #('realTimeInfo.dlna.org', 'DLNA.ORG_TLAG=*')
@@ -583,12 +584,14 @@ class ResourceRequestHandler:
             else:
                 ranges_field = HTTPRangeField({'npt': HTTPRange()})
             npt_range = ranges_field['npt']
-            resource = TranscodeResource(path, npt_range.start, npt_range.end)
+            self.resource = TranscodeResource(path, npt_range.start, npt_range.end)
             npt_range.size = '*'
             response_headers += [
                 (TIMESEEKRANGE_DLNA_ORG, HTTPRangeField({'npt': npt_range})),
                 ('Content-type', 'video/mpeg'),
                 ('Connection', 'close')]
+        elif 'thumbnail' in request.query:
+            assert False, 'Yay!!'
         else:
             content_features.support_range = True
             if 'Range' in request:
@@ -596,58 +599,76 @@ class ResourceRequestHandler:
             else:
                 ranges_field = HTTPRangeField({'bytes': HTTPRange()})
             bytes_range = ranges_field['bytes']
-            resource = FileResource(
+            self.resource = FileResource(
                 path,
                 int(bytes_range.start) if bytes_range.start else 0,
                 int(bytes_range.end) + 1 if bytes_range.end else None)
-            bytes_range.size = resource.size
+            bytes_range.size = self.resource.size
             response_headers += [
                 ('Content-Range', HTTPRangeField({'bytes': bytes_range})),
                 ('Accept-Ranges', 'bytes'),
                 ('Content-Type', guess_mimetype(path))]
-            if resource.length:
-                response_headers += [('Content-Length', resource.length)]
+            if self.resource.length:
+                response_headers += [('Content-Length', self.resource.length)]
             else:
                 response_headers += [('Connection', 'close')]
+        flags = fcntl.fcntl(self.resource, fcntl.F_GETFL)
+        fcntl.fcntl(self.resource, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         response_headers += [(CONTENTFEATURES_DLNA_ORG, content_features)]
-        self.resource = resource
-        self.socket = context.socket
         self.buffer = HTTPResponse(response_headers, code=206).to_bytes()
         logging.debug('Response header:\n%s', self.buffer.decode())
 
-    def __repr__(self):
-        return '<{} len(buffer)={} resource={}>'.format(
-            self.__class__.__name__,
-            len(self.buffer),
-            self.resource)
-
-    def run(self):
+    def handle(self, context):
+        bufsize = 0x1000000
         try:
-            while self.buffer:
-                while self.buffer:
+            self.start_response(context.request)
+            self.socket = context.socket
+            #~ timeout = self.socket.gettimeout()
+            #~ self.socket.settimeout(0)
+            flags = fcntl.fcntl(self.socket, fcntl.F_GETFL)
+            fcntl.fcntl(self.socket, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            while True:
+                readset = []
+                writeset = []
+                excptset = [self.resource, self.socket]
+                if len(self.buffer) < bufsize:
+                    readset.append(self.resource)
+                if len(self.buffer) > 0:
+                    writeset.append(self.socket)
+                else:
+                    logging.warning('Buffer underflow in %r', self)
+                readset, writeset, excptset = select.select(readset, writeset, excptset)
+                assert not excptset, excptset
+                if self.resource in readset:
+                    pulled = self.resource.read(bufsize - len(self.buffer))
+                    if not pulled and not self.buffer:
+                        break
+                    self.buffer += pulled
+                if self.socket in writeset:
                     try:
                         self.buffer = self.buffer[self.socket.send(self.buffer):]
                     except socket.error as exc:
-                        if exc.errno in [errno.EPIPE]:
+                        if exc.errno in [errno.EPIPE, errno.ECONNRESET]:
                             logging.info(
                                 'Connection with %s closed by peer during handler: %r',
                                 pretty_sockaddr(self.socket.peername),
                                 self.resource)
                             return False
                         raise
-                self.buffer = self.resource.read(0x20000)
-            return self.resource.length
+            return self.resource.length is not None
         finally:
             self.resource.close()
+            fcntl.fcntl(self.resource, fcntl.F_SETFL, flags)
+            #~ self.socket.settimeout(timeout)
 
 
-class SendBuffer:
+class BufferRequestHandler:
 
-    def __init__(self, buffer, context):
-        self.socket = context.socket
+    def __init__(self, buffer):
         self.buffer = buffer
 
-    def run(self):
+    def handle(self, context):
+        self.socket = context.socket
         while self.buffer:
             self.buffer = self.buffer[self.socket.send(self.buffer):]
         return True
@@ -706,8 +727,10 @@ class ContentDirectoryService:
                 if os.path.isdir(entry_path):
                     yield entry_path, entry, None
                 else:
+                    mimetype = guess_mimetype(entry_path)
                     yield entry_path, entry, False
-                    yield entry_path, entry+'+transcode', True
+                    if mimetype and mimetype.split('/')[0] == 'video':
+                        yield entry_path, entry+'+transcode', True
 
     def object_xml(self, parent_id, path, title, transcode):
         '''Returns XML describing a UPNP object'''
@@ -715,8 +738,9 @@ class ContentDirectoryService:
         element = etree.Element(
             'container' if isdir else 'item',
             id=path, parentID=parent_id, restricted='1')
-        #if isdir:
-        #    element.set('childCount', str(len(self.list_dlna_dir(path))))
+        # despite being optional, VLC requires childCount to browse subdirectories
+        if isdir:
+            element.set('childCount', str(len(self.list_dlna_dir(path))))
         etree.SubElement(element, 'dc:title').text = title
         class_elt = etree.SubElement(element, 'upnp:class')
         if isdir:
@@ -793,19 +817,8 @@ class ContentDirectoryService:
             NumberReturned=len(result_elements),
             TotalMatches=total_matches)
 
-class SOAPRequestHandler:
 
-    def __init__(self, context):
-        request = context.request
-        soapact = request['soapaction']
-        assert soapact[0] == '"' and soapact[-1] == '"', soapact
-        self.service_type, self.action = soapact[1:-1].rsplit('#', 1)
-        self.content_length = int(request['content-length'])
-        self.in_buf = b''
-        self.out_buf = b''
-        self.dms = context.dms
-        self.request = request
-        self.socket = context.socket
+class SOAPRequestHandler:
 
     def read_soap_request(self):
         buffer = b''
@@ -818,7 +831,16 @@ class SOAPRequestHandler:
             buffer += incoming
         return buffer
 
-    def run(self):
+    def handle(self, context):
+        request = context.request
+        soapact = request['soapaction']
+        assert soapact[0] == '"' and soapact[-1] == '"', soapact
+        self.service_type, self.action = soapact[1:-1].rsplit('#', 1)
+        self.content_length = int(request['content-length'])
+        self.dms = context.dms
+        self.request = request
+        self.socket = context.socket
+
         # we're already looking at the envelope, perhaps I should wrap this
         # with a Document so that absolute lookup is done instead? TODO
         soap_request = etree.fromstring(self.read_soap_request())
@@ -856,7 +878,7 @@ class SOAPRequestHandler:
         return {'SortCaps': 'dc:title'}
 
 
-class SocketWrapper:
+class SocketWrapper(socket.socket):
 
     logger = logging.getLogger('socket')
 
@@ -919,6 +941,9 @@ class SocketWrapper:
         return '<SocketWrapper sock={} peer={}>'.format(
             self.sockname,
             self.peername,)
+
+    def __getattr__(self, attr):
+        return getattr(self.__socket, attr)
 
 
 class SSDPAdvertiser:
@@ -1132,6 +1157,16 @@ class Events:
                 return None
 
 
+def exception_logging_decorator(func):
+    def callable():
+        try:
+            return func()
+        except:
+            logger.exception('Exception in thread %r:', threading.current_thread())
+            raise
+    return callable
+
+
 class DigitalMediaServer:
 
     def __init__(self, port, path):
@@ -1150,7 +1185,7 @@ class DigitalMediaServer:
     def run(self):
         threads = []
         for runnable in [self.http_server, self.ssdp_advertiser, self.ssdp_responder]:
-            thread = threading.Thread(target=runnable.run, name=runnable.__class__.__name__)
+            thread = threading.Thread(target=exception_logging_decorator(runnable.run), name=runnable.__class__.__name__)
             thread.daemon = True
             thread.start()
             threads.append(thread)
@@ -1163,7 +1198,7 @@ class DigitalMediaServer:
 
     def on_server_accept(self, sock):
         blah = HTTPConnection(SocketWrapper(sock), self)
-        thread = threading.Thread(target=blah.run, name=blah)
+        thread = threading.Thread(target=exception_logging_decorator(blah.run), name=blah)
         thread.daemon = True
         thread.start()
 
