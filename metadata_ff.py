@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import logging
+
 def res_data(path):
     from logging import getLogger
     logger = getLogger()
@@ -29,13 +31,17 @@ def res_data(path):
             list2cmdline(args),
             p.returncode))
         return {}
-    pusher = (l.rstrip() for l in stdout.decode('utf-8').splitlines())
+    pusher = (l.rstrip() for l in stdout.decode('cp1252').splitlines())
     data = {}
     def format():
         for line in pusher:
             if line == '[/FORMAT]':
                 return
-            tag, value = map(str.strip, line.split('=', 1))
+            try:
+                tag, value = map(str.strip, line.split('=', 1))
+            except ValueError as exc:
+                logging.error('Error parsing ffprobe format output line %r for file %r', line, path)
+                continue
             assert tag not in data
             #print(tag, value)
             if value != 'N/A':
