@@ -437,6 +437,9 @@ class FileResource:
         logging.debug('Closing %r', self)
         self.file.close()
 
+    def fileno(self):
+        return self.file.fileno()
+
 
 def dlna_npt_sec(npt_time):
     if ':' in npt_time:
@@ -482,7 +485,6 @@ class TranscodeResource:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-            #~ bufsize=0x40000,
         )
         #~ flags = fcntl.fcntl(self.__child.stdout, fcntl.F_GETFL)
         #~ fcntl.fcntl(self.__child.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -505,13 +507,14 @@ class TranscodeResource:
         logging.debug('Transcoder process terminated: %r', self)
 
     def _log_stderr(self):
+        # TODO switch to text mode
         for line in self.__child.stderr:
             self.logger.debug('Transcoder output on stderr: %r\n%s', self, line)
         self.logger.debug('EOF on transcoder stderr: %r', self)
 
     def read(self, count):
         output = self.__child.stdout.read(count)
-        logger.debug('Got %d bytes from stdout', len(output or ''))
+        logger.debug('Got %d bytes from transcoder stdout: %r', len(output), self)
         return output
 
     @property
@@ -555,6 +558,77 @@ class HTTPRangeField(dict):
 
     def __str__(self):
         return ' '.join('{}={}'.format(units, range) for units, range in self.items())
+
+
+class DiscontiguousBuffer:
+
+    def __init__(self):
+        self._deque = collections.deque()
+        self._size = 0
+
+    def append(self, item):
+        size = len(item)
+        self._size += size
+        return self._deque.append((item, size))
+
+    def appendleft(self, item):
+        size = len(item)
+        self._size += size
+        return self._deque.appendleft((item, size))
+
+    def pop(self):
+        item, size = self._deque.pop()
+        self._size -= size
+        return item
+
+    def popleft(self):
+        item, size = self._deque.popleft()
+        self._size -= size
+        return item
+
+    def size(self):
+        assert self._size >= 0, self._size
+        return self._size
+
+    def __getitem__(self, key):
+        return self._deque[key][0]
+
+    def __len__(self):
+        return len(self._deque)
+
+    def __repr__(self):
+        return '<%s size=%d, len=%d>' % (self.__class__.__name__, self.size(), len(self._deque))
+
+
+class QueueBuffer:
+
+    def __init__(self, maxbytes):
+        self._queue = queue.Queue()
+        self._curbytes = 0
+        self._maxbytes = maxbytes
+        self._cond = threading.Condition()
+
+    def put(self, item):
+        nbytes = len(item)
+        with self._cond:
+            while self._curbytes >= self._maxbytes:
+                self._cond.wait()
+            self._curbytes += nbytes
+        return self._queue.put((item, nbytes))
+
+    def get(self):
+        item, size = self._queue.get()
+        with self._cond:
+            self._curbytes -= size
+            self._cond.notify_all()
+        return item
+
+    def __repr__(self):
+        return '<{} curbytes={} maxbytes={} #items={}>'.format(
+            self.__class__.__name__,
+            self._curbytes,
+            self._maxbytes,
+            self._queue.qsize())
 
 
 class ResourceRequestHandler:
