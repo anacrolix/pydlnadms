@@ -324,7 +324,7 @@ class HTTPConnection:
                         buffer.decode())
                     handler = BufferRequestHandler(buffer)
                 # return true if another request can now be handled
-                if not handler.handle(context):
+                if not handler(context):
                     break
         finally:
             self.socket.close()
@@ -428,7 +428,10 @@ class FileResource:
 
     @property
     def length(self):
-        return (self.size if self.end is None else min(self.size, self.end)) - self.start
+        if self.end is None:
+            return None
+        else:
+            return self.end - self.start
 
     def __repr__(self):
         return '<FileResource path=%r, start=%r, end=%r>' % (self.file.name, self.start, self.end)
@@ -457,64 +460,83 @@ class TranscodeResource:
         return '<{} cmdline={!r} pid={} exitcode={}>'.format(
             self.__class__.__name__,
             subprocess.list2cmdline(self.args),
-            self.__child.pid,
-            self.__child.returncode)
+            self._child.pid,
+            self._child.returncode)
 
-    # todo, create the child in the run function
     def __init__(self, path, start, end):
-        args = ['ffmpeg', '-i', path]
-        if start:
-            args += ['-ss', start]
-        if end:
-            args += ['-t', str(dlna_npt_sec(end) - dlna_npt_sec(start))]
-        args += [
-            '-target', 'pal-dvd',
-            #~ '-threads', '4',
-            #~ '-vbsf', 'h264_mp4toannexb',
-            #~ '-vcodec', 'copy',
-            #~ '-acodec', 'copy',
-            #~ '-scodec', 'copy',
-            #~ '-timestamp', str(dlna_npt_sec(start)),
-            #~ '-copyts',
-            '-f', 'mpegts',
-            '-y', '/dev/stdout']
-        logging.debug('Starting transcoder: %r', args)
-        self.__child = subprocess.Popen(
+        if True:
+            args = ['ffmpeg', '-threads', '2']
+            if start:
+                args += ['-ss', start]
+            if end:
+                if start:
+                    args += ['-t', str(dlna_npt_sec(end) - dlna_npt_sec(start))]
+                else:
+                    args += ['-t', end]
+            args += [
+                '-i', path,
+                '-async', '1',
+                '-target', 'pal-dvd',
+                #~ '-vbsf', 'h264_mp4toannexb',
+                #~ '-vcodec', 'libx264',
+                #~ '-vpre', 'lossless_medium',
+                #~ '-acodec', 'ac3',
+                #~ '-vcodec', 'copy',
+                #~ '-acodec', 'copy',
+                #~ '-s', '720x576',
+                '-f', 'mpegts',
+                '-y', '/dev/stdout'
+            ]
+        elif False: pass
+            #args = ['mencoder']
+            # -ss and -endpos (not relative)
+            #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
+            #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
+            #~ '-af', 'lavcresample=48000', '-lavcopts',
+            #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
+            #~ '-o', '/dev/stdout', path
+        elif False: pass
+            #~ args = ['vlc', '-I', 'dummy']
+            #~ args += [
+                #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
+            # --start-time and --end-time (relative)
+                #~ path,
+        logging.debug('Starting transcoder with arguments: %r', args)
+        self._child = subprocess.Popen(
             args,
             stdin=open(os.devnull, 'rb'),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
         )
-        #~ flags = fcntl.fcntl(self.__child.stdout, fcntl.F_GETFL)
-        #~ fcntl.fcntl(self.__child.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        thread = threading.Thread(target=self._log_stderr)
-        thread.daemon = True
-        thread.start()
         self.args = args
+        self._child_stderr = os.fdopen(os.dup(self._child.stderr.fileno()), 'rt')
+        self._child.stderr.close()
+        self._stderr_thread = threading.Thread(target=self._log_stderr)
+        self._stderr_thread.start()
 
     def fileno(self):
-        return self.__child.stdout.fileno()
+        return self._child.stdout.fileno()
 
     def __del__(self):
-        assert self.__child.returncode is not None
+        self.close()
 
     def close(self):
-        self.__child.stdout.close()
-        self.__child.kill()
-        logging.debug('Terminating transcoder: %r', self)
-        self.__child.wait()
-        logging.debug('Transcoder process terminated: %r', self)
+        if self._child.returncode is None:
+            self._child.kill()
+            logging.debug('Terminating transcoder: %s', self)
+            self._child.wait()
+            logging.debug('Transcoder process terminated: %s', self)
+        self._stderr_thread.join()
 
     def _log_stderr(self):
-        # TODO switch to text mode
-        for line in self.__child.stderr:
-            self.logger.debug('Transcoder output on stderr: %r\n%s', self, line)
-        self.logger.debug('EOF on transcoder stderr: %r', self)
+        for line in self._child_stderr:
+            self.logger.debug('Transcoder output on stderr: %s\n%s', self, line.rstrip())
+        self.logger.debug('EOF on transcoder stderr: %s', self)
 
     def read(self, count):
-        output = self.__child.stdout.read(count)
-        logger.debug('Got %d bytes from transcoder stdout: %r', len(output), self)
+        output = self._child.stdout.read(count)
+        logger.debug('Got %r bytes from transcoder stdout: %s', (len(output) if output else output), self)
         return output
 
     @property
@@ -601,45 +623,88 @@ class DiscontiguousBuffer:
 
 
 class QueueBuffer:
+    '''A thread-safe FIFO that caps the total length of all items held.'''
 
     def __init__(self, maxbytes):
-        self._queue = queue.Queue()
+        self._deque = collections.deque()
         self._curbytes = 0
         self._maxbytes = maxbytes
         self._cond = threading.Condition()
+        self._closed = False
 
-    def put(self, item):
+    def put(self, item, always=False):
+        '''
+        Put an item into the queue.
+        If always, the buffer size limit is ignored.
+        Blocks until the buffer usage drops below the maximum.
+        Returns True if the queue is still open, and False if it's closed.
+        '''
         nbytes = len(item)
         with self._cond:
-            while self._curbytes >= self._maxbytes:
-                self._cond.wait()
-            self._curbytes += nbytes
-        return self._queue.put((item, nbytes))
+            while True:
+                if self.closed:
+                    return False
+                elif self._curbytes >= self._maxbytes and not always:
+                    self._cond.wait()
+                else:
+                    self._curbytes += nbytes
+                    self._deque.append((item, nbytes))
+                    self._cond.notify_all()
+                    return True
 
     def get(self):
-        item, size = self._queue.get()
+        '''
+        Returns an item from the queue.
+        Blocks until an item is available.
+        Returns None if no item is available and the queue is closed.
+        '''
         with self._cond:
-            self._curbytes -= size
-            self._cond.notify_all()
-        return item
+            while True:
+                if self._deque:
+                    item, nbytes = self._deque.popleft()
+                    self._curbytes -= nbytes
+                    assert self._curbytes >= 0
+                    self._cond.notify_all()
+                    return item
+                elif self.closed:
+                    return None
+                else:
+                    self._cond.wait()
 
-    def __repr__(self):
-        return '<{} curbytes={} maxbytes={} #items={}>'.format(
+    @property
+    def closed(self):
+        return self._closed
+
+    @property
+    def empty(self):
+        return self._curbytes == 0
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def __str__(self):
+        return '<{} curbytes={} maxbytes={} nchunks={}>'.format(
             self.__class__.__name__,
             self._curbytes,
             self._maxbytes,
-            self._queue.qsize())
+            len(self._deque))
 
 
 class ResourceRequestHandler:
 
+    def __init__(self):
+        self.buffer = QueueBuffer(0x2000000) # 32MiB
+        self.resource = None
+
     def __repr__(self):
-        return '<{} len(buffer)={} resource={}>'.format(
+        return '<{} buffer={} resource={}>'.format(
             self.__class__.__name__,
-            len(self.buffer),
+            self.buffer,
             self.resource)
 
-    def start_response(self, request):
+    def _start_response(self, request):
         path = request.query['path'][-1]
         response_headers = [
             ('Server', SERVER_FIELD),
@@ -662,8 +727,7 @@ class ResourceRequestHandler:
             npt_range.size = '*'
             response_headers += [
                 (TIMESEEKRANGE_DLNA_ORG, HTTPRangeField({'npt': npt_range})),
-                ('Content-type', 'video/mpeg'),
-                ('Connection', 'close')]
+                ('Content-type', 'video/mpeg'),]
         elif 'thumbnail' in request.query:
             assert False, 'Yay!!'
         else:
@@ -682,58 +746,72 @@ class ResourceRequestHandler:
                 ('Content-Range', HTTPRangeField({'bytes': bytes_range})),
                 ('Accept-Ranges', 'bytes'),
                 ('Content-Type', guess_mimetype(path))]
-            if self.resource.length:
-                response_headers += [('Content-Length', self.resource.length)]
-            else:
-                response_headers += [('Connection', 'close')]
-        flags = fcntl.fcntl(self.resource, fcntl.F_GETFL)
-        fcntl.fcntl(self.resource, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        response_headers += [(CONTENTFEATURES_DLNA_ORG, content_features)]
-        self.buffer = HTTPResponse(response_headers, code=206).to_bytes()
-        logging.debug('Response header:\n%s', self.buffer.decode())
+        if self.resource.length:
+            response_headers += [('Content-Length', self.resource.length)]
+        else:
+            response_headers += [('Connection', 'close')]
 
-    def handle(self, context):
-        bufsize = 0x1000000
+        # put the resource in non-blocking mode to maximize responsiveness
+        #
+        #~ flags = fcntl.fcntl(self.resource, fcntl.F_GETFL)
+        #~ fcntl.fcntl(self.resource, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        # put the response header as the first chunk in the buffer
+        #
+        response_headers += [(CONTENTFEATURES_DLNA_ORG, content_features)]
+        buf = HTTPResponse(response_headers, code=206).to_bytes()
+        # TODO it's silly converting to bytes and then back again to print it
+        # TODO decode using the HTTP standard encoding if one exists
+        logging.debug('Response header:\n%s', buf.decode())
+        self.buffer.put(buf, always=True)
+
+    def _feed_buffer(self):
         try:
-            self.start_response(context.request)
-            self.socket = context.socket
-            #~ timeout = self.socket.gettimeout()
-            #~ self.socket.settimeout(0)
-            flags = fcntl.fcntl(self.socket, fcntl.F_GETFL)
-            fcntl.fcntl(self.socket, fcntl.F_SETFL, flags | os.O_NONBLOCK)
             while True:
-                readset = []
-                writeset = []
-                excptset = [self.resource, self.socket]
-                if len(self.buffer) < bufsize:
-                    readset.append(self.resource)
-                if len(self.buffer) > 0:
-                    writeset.append(self.socket)
-                else:
-                    logging.warning('Buffer underflow in %r', self)
-                readset, writeset, excptset = select.select(readset, writeset, excptset)
-                assert not excptset, excptset
-                if self.resource in readset:
-                    pulled = self.resource.read(bufsize - len(self.buffer))
-                    if not pulled and not self.buffer:
-                        break
-                    self.buffer += pulled
-                if self.socket in writeset:
+                #~ readset, writeset, excptset = select.select([self.resource], [], [])
+                #~ assert not writeset and not excptset
+                #~ if self.resource in readset:
+                chunk = self.resource.read(0x20000) # 128KiB
+                if not chunk:
+                    break
+                logging.debug('Got %d bytes from resource: %r', len(chunk), self)
+                if not self.buffer.put(chunk):
+                    break
+                #~ else:
+                    #~ assert not readset
+        finally:
+            self.buffer.close()
+            logging.debug('Buffer feeder terminated: %s', self)
+
+    def __del__(self):
+        self.destroy()
+
+    def destroy(self):
+        self.buffer.close()
+        if self.resource is not None:
+            self.resource.close()
+
+    def __call__(self, context):
+        try:
+            self._start_response(context.request)
+            thread = threading.Thread(target=self._feed_buffer)
+            thread.start()
+            self.socket = context.socket
+            while not (self.buffer.closed and self.buffer.empty):
+                if self.buffer.empty:
+                    logging.warning('Buffer underflow: %s', self)
+                chunk = self.buffer.get()
+                while chunk:
                     try:
-                        self.buffer = self.buffer[self.socket.send(self.buffer):]
+                        chunk = chunk[self.socket.send(chunk):]
                     except socket.error as exc:
                         if exc.errno in [errno.EPIPE, errno.ECONNRESET]:
-                            logging.info(
-                                'Connection with %s closed by peer during handler: %r',
-                                pretty_sockaddr(self.socket.peername),
-                                self.resource)
+                            logging.info('Peer closed connection: %s', self)
                             return False
-                        raise
             return self.resource.length is not None
         finally:
-            self.resource.close()
-            fcntl.fcntl(self.resource, fcntl.F_SETFL, flags)
-            #~ self.socket.settimeout(timeout)
+            self.destroy()
+            thread.join()
 
 
 class BufferRequestHandler:
@@ -741,7 +819,7 @@ class BufferRequestHandler:
     def __init__(self, buffer):
         self.buffer = buffer
 
-    def handle(self, context):
+    def __call__(self, context):
         self.socket = context.socket
         while self.buffer:
             self.buffer = self.buffer[self.socket.send(self.buffer):]
@@ -843,8 +921,9 @@ class ContentDirectoryService:
             RESOURCE_PATH,
             urllib.parse.urlencode([('path', path)] + ([('transcode', '1')] if transcode else [])),
             None))
-        if not isdir and not transcode:
+        if not isdir:
             res_elt.set('size', str(os.path.getsize(path)))
+        if not transcode:
             from metadata_ff import res_data
             for attr, value in res_data(path).items():
                 res_elt.set(attr, str(value))
@@ -905,7 +984,7 @@ class SOAPRequestHandler:
             buffer += incoming
         return buffer
 
-    def handle(self, context):
+    def __call__(self, context):
         request = context.request
         soapact = request['soapaction']
         assert soapact[0] == '"' and soapact[-1] == '"', soapact
