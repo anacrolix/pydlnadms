@@ -263,7 +263,8 @@ class HTTPConnection:
     def read_request(self):
         buffer = b''
         while True:
-            ## determine bufsize so that body is left in the socket
+            # determine bufsize so that body is left in the socket
+            #
             peek_data = self.socket.recv(0x1000, socket.MSG_PEEK)
             index = (buffer + peek_data).find(HTTP_BODY_SEPARATOR)
             assert index >= -1, index
@@ -286,8 +287,8 @@ class HTTPConnection:
             buffer += data
             del data, bufsize, peek_data
 
-            # complete header hasn't arrived yet
             if index == -1:
+                # complete header hasn't arrived yet
                 continue
             del index
 
@@ -452,6 +453,22 @@ def dlna_npt_sec(npt_time):
         return float(npt_time)
 
 
+        #elif False: pass
+            #args = ['mencoder']
+            # -ss and -endpos (not relative)
+            #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
+            #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
+            #~ '-af', 'lavcresample=48000', '-lavcopts',
+            #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
+            #~ '-o', '/dev/stdout', path
+        #elif False: pass
+            #~ args = ['vlc', '-I', 'dummy']
+            #~ args += [
+                #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
+            # --start-time and --end-time (relative)
+                #~ path,
+
+
 class TranscodeResource:
 
     logger = logging
@@ -464,43 +481,29 @@ class TranscodeResource:
             self._child.returncode)
 
     def __init__(self, path, start, end):
-        if True:
-            args = ['ffmpeg', '-threads', '2']
+        args = [
+            'ffmpeg',
+            '-threads', '2',
+            '-async', '1',
+            # video and audio are usually put here, sometimes commentary is picked instead by ffmpeg if these streams aren't explicitly set
+            '-map', '0.0',
+            '-map', '0.1',
+        ]
+        if start:
+            args += ['-ss', start]
+        if end:
             if start:
-                args += ['-ss', start]
-            if end:
-                if start:
-                    args += ['-t', str(dlna_npt_sec(end) - dlna_npt_sec(start))]
-                else:
-                    args += ['-t', end]
-            args += [
-                '-i', path,
-                '-async', '1',
-                '-target', 'pal-dvd',
-                #~ '-vbsf', 'h264_mp4toannexb',
-                #~ '-vcodec', 'libx264',
-                #~ '-vpre', 'lossless_medium',
-                #~ '-acodec', 'ac3',
-                #~ '-vcodec', 'copy',
-                #~ '-acodec', 'copy',
-                #~ '-s', '720x576',
-                '-f', 'mpegts',
-                '-y', '/dev/stdout'
-            ]
-        elif False: pass
-            #args = ['mencoder']
-            # -ss and -endpos (not relative)
-            #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
-            #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
-            #~ '-af', 'lavcresample=48000', '-lavcopts',
-            #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
-            #~ '-o', '/dev/stdout', path
-        elif False: pass
-            #~ args = ['vlc', '-I', 'dummy']
-            #~ args += [
-                #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
-            # --start-time and --end-time (relative)
-                #~ path,
+                args += ['-t', str(dlna_npt_sec(end) - dlna_npt_sec(start))]
+            else:
+                args += ['-t', end]
+        args += [
+            '-i', path,
+            '-vcodec', 'mpeg2video',
+            '-sameq',
+            '-acodec', 'ac3', '-ab', '192k',
+            '-f', 'mpegts',
+            '-y', '/dev/stdout'
+        ]
         logging.debug('Starting transcoder with arguments: %r', args)
         self._child = subprocess.Popen(
             args,
@@ -510,8 +513,6 @@ class TranscodeResource:
             close_fds=True,
         )
         self.args = args
-        self._child_stderr = os.fdopen(os.dup(self._child.stderr.fileno()), 'rt')
-        self._child.stderr.close()
         self._stderr_thread = threading.Thread(target=self._log_stderr)
         self._stderr_thread.start()
 
@@ -525,14 +526,16 @@ class TranscodeResource:
         if self._child.returncode is None:
             self._child.kill()
             logging.debug('Terminating transcoder: %s', self)
-            self._child.wait()
-            logging.debug('Transcoder process terminated: %s', self)
         self._stderr_thread.join()
 
     def _log_stderr(self):
-        for line in self._child_stderr:
-            self.logger.debug('Transcoder output on stderr: %s\n%s', self, line.rstrip())
-        self.logger.debug('EOF on transcoder stderr: %s', self)
+        output = self._child.stderr.read()
+        assert self._child.returncode is None, self._child.returncode
+        if self._child.wait():
+            level = logging.ERROR
+        else:
+            level = logging.DEBUG
+        self.logger.log(level, '%s: Transcoder stderr:\n%s', self, output.decode('cp1252'))
 
     def read(self, count):
         output = self._child.stdout.read(count)
