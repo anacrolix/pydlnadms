@@ -858,6 +858,7 @@ def didl_lite(content):
 #objects.add_path('/media/data/towatch')
 #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
+
 class ContentDirectoryService:
 
     def __init__(self, root_id_path, res_scheme, res_netloc):
@@ -865,37 +866,35 @@ class ContentDirectoryService:
         self.res_scheme = res_scheme
         self.res_netloc = res_netloc
 
-    # TODO remove this, so I can do fancier and faster shit with mimetypes and transcoding
-    class list_dlna_dir:
-        def __init__(self, path):
-            self.path = path
-            try:
-                self.entries = os.listdir(path)
-            except:
-                logger.warning('Error listing directory: %s', sys.exc_info()[1])
-                self.entries = []
-        def __len__(self):
-            return len(self.entries)
-        def __iter__(self):
-            for entry in sorted(self.entries):
-                entry_path = os.path.join(self.path, entry)
-                if os.path.isdir(entry_path):
-                    yield entry_path, entry, None
-                else:
-                    mimetype = guess_mimetype(entry_path)
-                    yield entry_path, entry, False
-                    if mimetype and mimetype.split('/')[0] == 'video':
-                        yield entry_path, entry+'+transcode', True
+    def list_dlna_dir(self, path):
+        '''Yields a sequence of Entry's'''
+        Entry = collections.namedtuple('Entry', ['path', 'transcode', 'title', 'mimetype'])
+        try:
+            names = os.listdir(path)
+        except:
+            logger.warning('Error listing directory: %s', sys.exc_info()[1])
+            names = []
+        for name in sorted(names):
+            entry_path = os.path.join(path, name)
+            mimetype = guess_mimetype(entry_path)
+            entry = Entry(path=entry_path, transcode=False, title=name, mimetype=mimetype)
+            yield entry
+            if mimetype and mimetype.split('/')[0] == 'video':
+                # forward slashes cannot be used in normal file names >:D
+                yield entry._replace(transcode=True, title=name+'/transcode')
 
-    def object_xml(self, parent_id, path, title, transcode):
+    def object_xml(self, parent_id, cdentry):
         '''Returns XML describing a UPNP object'''
+        path = cdentry.path
+        transcode = cdentry.transcode
+        title = cdentry.title
         isdir = os.path.isdir(path)
         element = etree.Element(
             'container' if isdir else 'item',
             id=path, parentID=parent_id, restricted='1')
         # despite being optional, VLC requires childCount to browse subdirectories
         if isdir:
-            element.set('childCount', str(len(self.list_dlna_dir(path))))
+            element.set('childCount', str(sum(1 for e in self.list_dlna_dir(path))))
         etree.SubElement(element, 'dc:title').text = title
         class_elt = etree.SubElement(element, 'upnp:class')
         if isdir:
@@ -916,7 +915,7 @@ class ContentDirectoryService:
             content_features.support_range = True
         res_elt = etree.SubElement(element, 'res',
             protocolInfo='http-get:*:{}:{}'.format(
-                '*' if isdir else 'video/mpeg' if transcode else guess_mimetype(path),
+                '*' if isdir else 'video/mpeg' if transcode else cdentry.mimetype,
                 content_features))
         res_elt.text = urllib.parse.urlunsplit((
             self.res_scheme,
@@ -925,7 +924,10 @@ class ContentDirectoryService:
             urllib.parse.urlencode([('path', path)] + ([('transcode', '1')] if transcode else [])),
             None))
         if not isdir:
-            res_elt.set('size', str(os.path.getsize(path)))
+            try:
+                res_elt.set('size', str(os.path.getsize(path)))
+            except OSError as exc:
+                logging.warning('%s', exc)
         if not transcode:
             from metadata_ff import res_data
             for attr, value in res_data(path).items():
@@ -958,8 +960,7 @@ class ContentDirectoryService:
                 end = min(start + count, end)
             result_elements = []
             for index in range(start, end):
-                child_path, title, transcode = children[index]
-                result_elements.append(self.object_xml(ObjectID, child_path, title, transcode))
+                result_elements.append(self.object_xml(ObjectID, children[index]))
             total_matches = len(children)
         else: # TODO check other flags
             parent_id = path_to_object_id(os.path.normpath(os.path.split(path)[0]))
@@ -1389,7 +1390,7 @@ def main():
     import logging, logging.config
     if opts.logging_conf is None:
         formatter = logging.Formatter(
-            '%(asctime)s.%(msecs)3d;%(levelname)s;%(name)s;%(message)s',
+            '%(asctime)s.%(msecs)03d;%(levelname)s;%(name)s;%(message)s',
             datefmt='%H:%M:%S')
         handler = logging.StreamHandler()
         handler.setFormatter(formatter)
