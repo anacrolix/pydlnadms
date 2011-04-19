@@ -31,7 +31,9 @@ def res_data(path):
             list2cmdline(args),
             p.returncode))
         return {}
-    pusher = (l.rstrip() for l in stdout.decode('cp1252').splitlines())
+    # TODO an alternative here could be to try several encodings in succession:
+    # utf-8, cp1252, and the western european one whatever it is
+    pusher = (l.rstrip() for l in stdout.decode('cp1252', errors='ignore').splitlines())
     data = {}
     def format():
         for line in pusher:
