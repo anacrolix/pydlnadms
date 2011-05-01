@@ -874,7 +874,7 @@ class ContentDirectoryService:
         except:
             logger.warning('Error listing directory: %s', sys.exc_info()[1])
             names = []
-        for name in sorted(names):
+        for name in sorted(names, key=str.lower):
             entry_path = os.path.join(path, name)
             mimetype = guess_mimetype(entry_path)
             entry = Entry(path=entry_path, transcode=False, title=name, mimetype=mimetype)
