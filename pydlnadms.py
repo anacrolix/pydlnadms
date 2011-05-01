@@ -1199,7 +1199,7 @@ class SSDPResponder:
             self.logger.debug('Ignoring M-SEARCH for %r from %s', st, peeraddr[0])
             return
         for st in sts:
-            self.send_msearch_reply(peeraddr, st)
+            # respond at a random time between 1 and MX seconds from now
             self.events.add(
                 self.send_msearch_reply,
                 args=[peeraddr, st],
