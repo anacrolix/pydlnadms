@@ -18,6 +18,7 @@ import queue
 import random
 import select
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -43,6 +44,8 @@ if sys.version_info.major <= 3 and sys.version_info.minor < 2:
 
 
 def pretty_sockaddr(addr):
+    '''Convert a standard Python tuple representing a sockaddr and returns it in the usual text representation'''
+    # IPv4 only?
     assert len(addr) == 2, addr
     return '{}:{:d}'.format(addr[0], addr[1])
 
@@ -485,7 +488,8 @@ class TranscodeResource:
             'ffmpeg',
             '-threads', '2',
             '-async', '1',
-            # video and audio are usually put here, sometimes commentary is picked instead by ffmpeg if these streams aren't explicitly set
+            # video and audio are usually the first channels sometimes commentary is
+            # picked instead by ffmpeg if these streams aren't explicitly set
             '-map', '0.0',
             '-map', '0.1',
         ]
@@ -500,7 +504,8 @@ class TranscodeResource:
             '-i', path,
             '-vcodec', 'mpeg2video',
             '-sameq',
-            '-acodec', 'ac3', '-ab', '192k',
+            # forcing a channel count is sometimes required due to audio encoding
+            '-acodec', 'ac3', '-ab', '192k', '-ac', '2',
             '-f', 'mpegts',
             '-y', '/dev/stdout'
         ]
@@ -1188,7 +1193,7 @@ class SSDPResponder:
     def process_message(self, data, peeraddr):
         request = HTTPRequest.from_bytes(data)
         if request.method != 'M-SEARCH':
-            logging.info('Ignoring %r request from %s', request.method, peeraddr)
+            logging.info('Ignoring %r request from %s', request.method, pretty_sockaddr(peeraddr))
             return
         st = request['st']
         if st in self.dms.all_targets:
@@ -1196,8 +1201,8 @@ class SSDPResponder:
         elif st == 'ssdp:all':
             sts = self.dms.all_targets
         else:
-            self.logger.debug('Ignoring M-SEARCH for %r from %s', st, peeraddr[0])
-            return
+            self.logger.debug('Ignoring M-SEARCH for %r from %s', st, pretty_sockaddr(peeraddr))
+            sts = []
         for st in sts:
             # respond at a random time between 1 and MX seconds from now
             self.events.add(
@@ -1232,18 +1237,15 @@ class SSDPResponder:
                 ('SERVER', SERVER_FIELD),
                 ('ST', st),
                 ('USN', self.usn_from_target(st))
-            ], code=200
-        ).to_bytes()
+            ], code=200).to_bytes()
         sock.send(buf)
         sock.close()
-        self.logger.debug('Responded to M-SEARCH from %s', pretty_sockaddr(peeraddr))
+        self.logger.debug('Responded to M-SEARCH from %s: %r', pretty_sockaddr(peeraddr), buf)
 
     def __init__(self, dms):
-        import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         s.bind(('', SSDP_PORT))
-        import struct
         mreqn = struct.pack(
             '4s4si',
             socket.inet_aton(SSDP_MCAST_ADDR),
@@ -1347,7 +1349,9 @@ class DigitalMediaServer:
     def run(self):
         threads = []
         for runnable in [self.http_server, self.ssdp_advertiser, self.ssdp_responder]:
-            thread = threading.Thread(target=exception_logging_decorator(runnable.run), name=runnable.__class__.__name__)
+            thread = threading.Thread(
+                target=exception_logging_decorator(runnable.run),
+                name=runnable.__class__.__name__)
             thread.daemon = True
             thread.start()
             threads.append(thread)
