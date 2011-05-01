@@ -1256,10 +1256,15 @@ class SSDPResponder:
 
     def run(self):
         while True:
-            # MTU should limit UDP packet sizes to well below this
-            data, addr = self.socket.recvfrom(0x1000)
-            assert len(data) < 0x1000, len(addr)
-            self.process_message(data, addr)
+            timeout = self.events.poll()
+            readset = select.select([self.socket], [], [], timeout)[0]
+            if self.socket in readset:
+                # MTU should limit UDP packet sizes to well below this
+                data, addr = self.socket.recvfrom(0x1000)
+                assert len(data) < 0x1000, len(addr)
+                self.process_message(data, addr)
+            else:
+                self.logger.debug('Select timed out')
 
 
 def make_device_desc(udn):
