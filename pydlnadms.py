@@ -490,8 +490,9 @@ class TranscodeResource:
             '-async', '1',
             # video and audio are usually the first channels sometimes commentary is
             # picked instead by ffmpeg if these streams aren't explicitly set
-            '-map', '0.0',
-            '-map', '0.1',
+            # there's no guarantee of video or audio stream ordering, so can't explicitly map
+            #~ '-map', '0.0',
+            #~ '-map', '0.1',
         ]
         if start:
             args += ['-ss', start]
