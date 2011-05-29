@@ -8,9 +8,12 @@ from ctypes import (
 import collections
 import ctypes.util
 import ctypes
+import logging
 import pdb
+import sys
 
 IFF_LOOPBACK = 0x8
+IFF_MULTICAST = 0x1000
 
 sa_family_t = c_ushort
 
@@ -89,6 +92,7 @@ def ifap_iter(ifap):
     '''Iterate over linked list of ifaddrs'''
     ifa = ifap.contents
     while True:
+        logging.debug('Yielding interface with name %r', ifa.ifa_name)
         yield ifa
         if not ifa.ifa_next:
             break
@@ -136,17 +140,21 @@ def getifaddrs():
     try:
         retval = []
         for ifa in ifap_iter(ifap):
-            family, addr = pythonize_sockaddr(ifa.ifa_addr.contents)
-            retval.append(py_ifaddrs(
-                name=ifa.ifa_name,
-                family=family,
-                flags=ifa.ifa_flags,
-                addr=addr,
-                netmask=ifa.ifa_netmask,))
+            pia = py_ifaddrs(name=ifa.ifa_name, flags=ifa.ifa_flags)
+            if ifa.ifa_addr:
+                pia.family, pia.addr = pythonize_sockaddr(ifa.ifa_addr.contents)
+            else:
+                pia.family, pia.addr = None, None
+            if ifa.ifa_netmask:
+                pia.netmask = pythonize_sockaddr(ifa.ifa_netmask.contents)[1]
+            else:
+                pia.netmask = None
+            retval.append(pia)
         return retval
     finally:
         _freeifaddrs(ifap)
 
 if __name__ == '__main__':
-    from pprint import pprint
-    pprint(getifaddrs())
+    logging.basicConfig(level=0, stream=sys.stderr)
+    import pprint
+    pprint.pprint(getifaddrs())
