@@ -1041,7 +1041,7 @@ class SOAPRequestHandler:
         return {'SortCaps': 'dc:title'}
 
 
-class SocketWrapper(socket.socket):
+class SocketWrapper:
 
     logger = logging.getLogger('socket')
 
@@ -1106,6 +1106,7 @@ class SocketWrapper(socket.socket):
             self.peername,)
 
     def __getattr__(self, attr):
+        self.logger.debug('Called %r on %r', attr, self)
         return getattr(self.__socket, attr)
 
 
@@ -1187,6 +1188,7 @@ class SSDPAdvertiser:
             logger.debug('Waiting for next advertisement event: %r', timeout)
             time.sleep(timeout)
 
+
 class SSDPResponder:
 
     logger = logger
@@ -1194,7 +1196,7 @@ class SSDPResponder:
     def process_message(self, data, peeraddr):
         request = HTTPRequest.from_bytes(data)
         if request.method != 'M-SEARCH':
-            logging.info('Ignoring %r request from %s', request.method, pretty_sockaddr(peeraddr))
+            logging.debug('Ignoring %r request from %s', request.method, pretty_sockaddr(peeraddr))
             return
         st = request['st']
         if st in self.dms.all_targets:
@@ -1322,6 +1324,7 @@ class Events:
                 return None
 
 
+# TODO this could probably have named param to set the logger
 def exception_logging_decorator(func):
     def callable():
         try:
