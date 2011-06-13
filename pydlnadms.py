@@ -236,13 +236,15 @@ class HTTPResponse:
 
 
 def httpify_headers(headers):
-    from itertools import chain
+    '''Build HTTP headers string, including the trailing CRLF's for each header'''
     def lines():
         for key, value in headers:
             assert key, key
-            value = str(value)
-            yield ':'.join([str(key), ' '+value if value else value])
-    return '\r\n'.join(chain(lines(), ['']))
+            if value:
+                yield '{}: {}'.format(key, value)
+            else:
+                yield key + ':'
+    return '\r\n'.join(itertools.chain(lines(), ['']))
 
 def rfc1123_date():
     import time
@@ -1280,7 +1282,8 @@ class Events:
         heapq.heappush(self.events, (time.time() + delay, callback, args))
 
     def poll(self):
-        # execute any events that've passed their due times
+        '''Execute any callbacks that are due, and return the time in seconds until the next event
+        will be ready, or None if there are none pending.'''
         while True:
             if self.events:
                 timeout = self.events[0][0] - time.time()
