@@ -1309,12 +1309,12 @@ def exception_logging_decorator(func):
 
 class DigitalMediaServer:
 
-    def __init__(self, port, path):
+    def __init__(self, port, path, notify_interval):
         # use a hash of the friendly name (should be unique enough)
         self.device_uuid = 'uuid:deadbeef-0000-0000-0000-{}'.format(
             '{:012x}'.format(abs(hash(ROOT_DEVICE_FRIENDLY_NAME)))[-12:])
         logger.info('DMS UUID is %r', self.device_uuid)
-        self.notify_interval = 895
+        self.notify_interval = notify_interval
         self.device_desc = make_device_desc(self.device_uuid)
         self.http_server = HTTPServer(port, self.on_server_accept)
         self.ssdp_advertiser = SSDPAdvertiser(self)
@@ -1363,13 +1363,15 @@ def main():
     from optparse import OptionParser
     parser = OptionParser(
         usage='%prog [options] [PATH]',
-        description='Serves media from the given PATH over UPnP AV and DLNA.')
+        description='Serves media from the given PATH over UPnP-AV and DLNA.')
     parser.add_option(
         '-p', '--port', type='int', default=1337,
         help='media server listen PORT')
     parser.add_option(
         '--logging_conf',
         help='Path of Python logging configuration file')
+    parser.add_option('--notify-interval', '-n', type='int', default=895,
+        help='time in seconds between server advertisements on the network')
     opts, args = parser.parse_args()
 
     import logging, logging.config
@@ -1397,7 +1399,7 @@ def main():
         parser.error('Only one path is allowed')
     path = os.path.normpath(path)
 
-    DigitalMediaServer(opts.port, path)
+    DigitalMediaServer(opts.port, path, notify_interval=opts.notify_interval)
 
 if __name__ == '__main__':
     main()
