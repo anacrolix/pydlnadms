@@ -914,7 +914,7 @@ class ContentDirectoryService:
         else:
             return object_id
 
-    def Browse(self, BrowseFlag, StartingIndex, RequestedCount, ObjectID, Filter, SortCriteria):
+    def Browse(self, BrowseFlag, StartingIndex, RequestedCount, ObjectID, Filter=None, SortCriteria=None):
         '''(list of CD objects in XML, total possible elements)'''
         path = self.object_id_to_path(ObjectID)
         if BrowseFlag == 'BrowseDirectChildren':
