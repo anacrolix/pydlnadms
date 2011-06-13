@@ -9,6 +9,7 @@ import fcntl
 import http.client
 import getpass
 import heapq
+import itertools
 import logging # deleted at end of module
 import os
 import os.path
@@ -25,6 +26,7 @@ import threading
 import time
 import urllib.parse
 from xml.sax.saxutils import escape as xml_escape
+from getifaddrs import getifaddrs
 
 
 logger = logging.getLogger('pydlnadms')
@@ -44,13 +46,13 @@ if sys.version_info.major <= 3 and sys.version_info.minor < 2:
 
 
 def pretty_sockaddr(addr):
-    '''Convert a standard Python tuple representing a sockaddr and returns it in the usual text representation'''
+    '''Converts a standard Python sockaddr tuple and returns it in the normal text representation'''
     # IPv4 only?
     assert len(addr) == 2, addr
     return '{}:{:d}'.format(addr[0], addr[1])
 
 
-EXPIRY_FUDGE = 10
+EXPIRY_FUDGE = 5
 UPNP_ROOT_DEVICE = 'upnp:rootdevice'
 UPNP_DOMAIN_NAME = 'schemas-upnp-org'
 ROOT_DESC_PATH = '/rootDesc.xml'
@@ -151,9 +153,6 @@ for service, domain, version, actions, statevars in [
         xmlDescription=make_xml_service_description(actions, statevars)))
 
 HTTP_BODY_SEPARATOR = b'\r\n' * 2
-
-def http_message(first_line, headers, body):
-    return (first_line + '\r\n' + httpify_headers(headers) + '\r\n').encode('utf-8') + body
 
 
 class HTTPMessage:
@@ -456,23 +455,24 @@ def dlna_npt_sec(npt_time):
         return float(npt_time)
 
 
-        #elif False: pass
-            #args = ['mencoder']
-            # -ss and -endpos (not relative)
-            #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
-            #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
-            #~ '-af', 'lavcresample=48000', '-lavcopts',
-            #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
-            #~ '-o', '/dev/stdout', path
-        #elif False: pass
-            #~ args = ['vlc', '-I', 'dummy']
-            #~ args += [
-                #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
-            # --start-time and --end-time (relative)
-                #~ path,
-
-
 class TranscodeResource:
+
+    # alternate transcoder arguments
+
+    #elif False: pass
+        #args = ['mencoder']
+        # -ss and -endpos (not relative)
+        #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
+        #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
+        #~ '-af', 'lavcresample=48000', '-lavcopts',
+        #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
+        #~ '-o', '/dev/stdout', path
+    #elif False: pass
+        #~ args = ['vlc', '-I', 'dummy']
+        #~ args += [
+            #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
+        # --start-time and --end-time (relative)
+            #~ path,
 
     logger = logging
 
@@ -589,46 +589,6 @@ class HTTPRangeField(dict):
 
     def __str__(self):
         return ' '.join('{}={}'.format(units, range) for units, range in self.items())
-
-
-class DiscontiguousBuffer:
-
-    def __init__(self):
-        self._deque = collections.deque()
-        self._size = 0
-
-    def append(self, item):
-        size = len(item)
-        self._size += size
-        return self._deque.append((item, size))
-
-    def appendleft(self, item):
-        size = len(item)
-        self._size += size
-        return self._deque.appendleft((item, size))
-
-    def pop(self):
-        item, size = self._deque.pop()
-        self._size -= size
-        return item
-
-    def popleft(self):
-        item, size = self._deque.popleft()
-        self._size -= size
-        return item
-
-    def size(self):
-        assert self._size >= 0, self._size
-        return self._size
-
-    def __getitem__(self, key):
-        return self._deque[key][0]
-
-    def __len__(self):
-        return len(self._deque)
-
-    def __repr__(self):
-        return '<%s size=%d, len=%d>' % (self.__class__.__name__, self.size(), len(self._deque))
 
 
 class QueueBuffer:
@@ -836,6 +796,8 @@ class BufferRequestHandler:
 
 
 def soap_action_response(service_type, action_name, arguments):
+    # some clients expect the xml version to be at the very start of the document
+    # maybe it's part of XML, maybe those clients suck. i don't know. don't move it.
     return '''<?xml version="1.0"?>
 <s:Envelope
         xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
@@ -859,10 +821,6 @@ def didl_lite(content):
     xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
     xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">
         ''' + content + r'</DIDL-Lite>')
-
-#objects = Objects()
-#objects.add_path('/media/data/towatch')
-#<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
 
 class ContentDirectoryService:
@@ -888,6 +846,8 @@ class ContentDirectoryService:
             if mimetype and mimetype.split('/')[0] == 'video':
                 # forward slashes cannot be used in normal file names >:D
                 yield entry._replace(transcode=True, title=name+'/transcode')
+
+    #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
     def object_xml(self, parent_id, cdentry):
         '''Returns XML describing a UPNP object'''
@@ -1042,6 +1002,10 @@ class SOAPRequestHandler:
 
 
 class SocketWrapper:
+    '''
+    This class should unintrusively provide logging of various socket stuff.
+    May or may not have performance implications, but then this is Python.
+    '''
 
     logger = logging.getLogger('socket')
 
@@ -1111,6 +1075,9 @@ class SocketWrapper:
 
 
 class SSDPAdvertiser:
+    '''
+    Sends SSDP notification events at regular intervals.
+    '''
 
     logger = logger
 
@@ -1190,6 +1157,9 @@ class SSDPAdvertiser:
 
 
 class SSDPResponder:
+    '''
+    Listens for, and responds to SSDP searches.
+    '''
 
     logger = logger
 
@@ -1301,6 +1271,7 @@ def make_device_desc(udn):
 
 
 class Events:
+    '''A heap of delayed callbacks'''
 
     def __init__(self):
         self.events = []
@@ -1326,6 +1297,7 @@ class Events:
 
 # TODO this could probably have named param to set the logger
 def exception_logging_decorator(func):
+    '''Log exceptions and reraise them.'''
     def callable():
         try:
             return func()
