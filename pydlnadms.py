@@ -13,6 +13,7 @@ import itertools
 import logging # deleted at end of module
 import os
 import os.path
+import pdb
 import platform
 import pprint
 import queue
@@ -501,6 +502,7 @@ class TranscodeResource:
                 args += ['-t', end]
         args += [
             '-i', path,
+            # '-target', 'pal-dvd', # or film?
             '-vcodec', 'mpeg2video',
             '-sameq',
             # forcing a channel count is sometimes required due to audio encoding
@@ -508,17 +510,21 @@ class TranscodeResource:
             '-f', 'mpegts',
             '-y', '/dev/stdout'
         ]
-        logging.debug('Starting transcoder with arguments: %r', args)
-        self._child = subprocess.Popen(
-            args,
-            stdin=open(os.devnull, 'rb'),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-        )
         self.args = args
         self._stderr_thread = threading.Thread(target=self._log_stderr)
-        self._stderr_thread.start()
+        logging.debug('Starting transcoder with arguments: %r', args)
+        try:
+            self._child = subprocess.Popen(
+                args,
+                stdin=open(os.devnull, 'rb'),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True)
+        except OSError as exc:
+            self._child = None
+            logging.error('Error opening transcoder: %s', exc)
+        else:
+            self._stderr_thread.start()
 
     def fileno(self):
         return self._child.stdout.fileno()
@@ -527,10 +533,13 @@ class TranscodeResource:
         self.close()
 
     def close(self):
-        if self._child.returncode is None:
-            self._child.kill()
-            logging.debug('Terminating transcoder: %s', self)
-        self._stderr_thread.join()
+        if self._child is not None:
+            if self._child.returncode is None:
+                # child has finished yet
+                self._child.kill()
+                logging.debug('Terminating transcoder: %s', self)
+        if self._stderr_thread.is_alive():
+            self._stderr_thread.join()
 
     def _log_stderr(self):
         output = self._child.stderr.read()
@@ -542,6 +551,8 @@ class TranscodeResource:
         self.logger.log(level, '%s: Transcoder stderr:\n%s', self, output.decode('cp1252'))
 
     def read(self, count):
+        if not self._child:
+            return None
         output = self._child.stdout.read(count)
         logger.debug('Got %r bytes from transcoder stdout: %s', (len(output) if output else output), self)
         return output
