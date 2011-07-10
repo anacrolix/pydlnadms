@@ -204,10 +204,6 @@ class HTTPRequest:
     def from_bytes(cls, buf):
         lines = (a.decode('utf-8') for a in buf.split(b'\r\n'))
         method, path, protocol = lines.__next__().split()
-        if protocol != 'HTTP/1.1':
-            logger.warning('Untested protocol in HTTP request: %r', protocol)
-        from urllib.parse import unquote
-        path = unquote(path)
         request = cls(method, path)
         for h in lines:
             if h:
