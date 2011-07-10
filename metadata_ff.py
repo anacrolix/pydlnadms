@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import errno
 import logging
 
 def res_data(path):
@@ -20,7 +21,7 @@ def res_data(path):
             close_fds=True
         )
     except OSError as exc:
-        if exc.errno == ENOENT:
+        if exc.errno == errno.ENOENT:
             logging.error('Failed to open %r: %s', list2cmdline(args), exc)
             return {}
         else:
