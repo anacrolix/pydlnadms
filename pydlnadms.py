@@ -1233,15 +1233,32 @@ class SSDPResponder:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         s.bind(('', SSDP_PORT))
-        mreqn = struct.pack(
-            '4s4si',
-            socket.inet_aton(SSDP_MCAST_ADDR),
-            socket.inet_aton('0.0.0.0'),
-            0)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreqn)
         self.socket = SocketWrapper(s)
         self.events = Events()
         self.dms = dms
+        self.update_multicast_membership()
+
+    def update_multicast_membership(self):
+        try:
+            for ifaddr in getifaddrs():
+                if ifaddr.family == self.socket.family:
+                    self.logger.debug(
+                        'Adding SSDPResponder socket to multicast group on interface %r',
+                        ifaddr.addr[0],)
+                    mreqn = struct.pack(
+                        '4s4si',
+                        socket.inet_aton(SSDP_MCAST_ADDR),
+                        socket.inet_aton(ifaddr.addr[0]),
+                        0)
+                    try:
+                        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreqn)
+                    except socket.error as exc:
+                        if exc.errno == errno.EADDRINUSE:
+                            self.logger.debug(exc)
+                        else:
+                            self.logger.exception(exc)
+        finally:
+            self.events.add(self.update_multicast_membership, delay=15)
 
     def run(self):
         while True:
