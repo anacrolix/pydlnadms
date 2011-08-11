@@ -1133,10 +1133,15 @@ class SSDPAdvertiser:
                 self.ssdp_multicast(family, addr, buf)
         self.logger.debug('Sent SSDP byebye notifications')
 
-    def notify_alive(self):
+    def notify_alive(self, last_interfaces=frozenset()):
         # TODO for each interface
         # sends should also be delayed 100ms by eventing
-        for family, addr in self.notify_interfaces:
+        interfaces = set(self.notify_interfaces)
+        for if_ in interfaces - last_interfaces:
+            self.logger.info('Notify interface came up: %s', if_)
+        for if_ in last_interfaces - interfaces:
+            self.logger.info('Notify interface went down: %s', if_)
+        for family, addr in interfaces:
             for nt in self.dms.all_targets:
                 buf = HTTPRequest('NOTIFY', '*', [
                     ('HOST', '{}:{:d}'.format(SSDP_MCAST_ADDR, SSDP_PORT)),
@@ -1154,8 +1159,8 @@ class SSDPAdvertiser:
                     self.ssdp_multicast,
                     args=[family, addr, buf],
                     delay=random.uniform(0, 0.1))
-            self.logger.info('Sending SSDP alive notifications from %s', addr[0])
-        self.events.add(self.notify_alive, delay=self.notify_interval)
+            self.logger.debug('Sending SSDP alive notifications from %s', addr[0])
+        self.events.add(self.notify_alive, delay=self.notify_interval, args=[interfaces])
 
     def run(self):
         self.events.add(self.notify_alive, delay=0.1)
