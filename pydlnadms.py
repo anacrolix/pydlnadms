@@ -771,8 +771,8 @@ class ResourceRequestHandler:
 
     def __call__(self, context):
         try:
-            self._start_response(context.request)
             thread = threading.Thread(target=self._feed_buffer)
+            self._start_response(context.request)
             thread.start()
             self.socket = context.socket
             while not (self.buffer.closed and self.buffer.empty):
