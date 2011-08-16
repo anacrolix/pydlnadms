@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+
+import sys
+
+path, start, end = sys.argv[1:]
+
+# alternate transcoder arguments
+
+#elif False: pass
+    #args = ['mencoder']
+    # -ss and -endpos (not relative)
+    #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
+    #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
+    #~ '-af', 'lavcresample=48000', '-lavcopts',
+    #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
+    #~ '-o', '/dev/stdout', path
+#elif False: pass
+    #~ args = ['vlc', '-I', 'dummy']
+    #~ args += [
+        #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
+    # --start-time and --end-time (relative)
+        #~ path,
+
+args = [
+    'ffmpeg',
+    '-threads', '4',
+    '-async', '1',
+    # video and audio are usually the first channels sometimes commentary is
+    # picked instead by ffmpeg if these streams aren't explicitly set
+    # there's no guarantee of video or audio stream ordering, so can't explicitly map
+    #~ '-map', '0.0',
+    #~ '-map', '0.1',
+]
+if start:
+    args += ['-ss', start]
+if end:
+    if start:
+        args += ['-t', str(float(end) - float(start))]
+    else:
+        args += ['-t', end]
+args += [
+    '-i', path,
+    '-target', 'pal-dvd', # or film?
+    #~ '-vcodec', 'mpeg2video',
+    #~ '-b'
+    #~ '-sameq',
+    #~ '-aspect', '16:9',
+    #~ '-s', '1280x720',
+    # forcing a channel count is sometimes required due to audio encoding
+    '-acodec', 'ac3', '-ab', '192k', '-ac', '2',
+    '-f', 'mpegts',
+    '-y', '/dev/stdout'
+]
+
+import os
+os.execvp(args[0], args)

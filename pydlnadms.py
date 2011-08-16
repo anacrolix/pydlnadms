@@ -456,66 +456,24 @@ def dlna_npt_sec(npt_time):
 
 class TranscodeResource:
 
-    # alternate transcoder arguments
-
-    #elif False: pass
-        #args = ['mencoder']
-        # -ss and -endpos (not relative)
-        #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
-        #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
-        #~ '-af', 'lavcresample=48000', '-lavcopts',
-        #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
-        #~ '-o', '/dev/stdout', path
-    #elif False: pass
-        #~ args = ['vlc', '-I', 'dummy']
-        #~ args += [
-            #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
-        # --start-time and --end-time (relative)
-            #~ path,
-
     logger = logging
 
     def __repr__(self):
         return '<{} cmdline={!r} pid={} exitcode={}>'.format(
             self.__class__.__name__,
             subprocess.list2cmdline(self.args),
-            self._child.pid,
-            self._child.returncode)
+            self._child if self._child is None else self._child.pid,
+            self._child if self._child is None else self._child.returncode)
 
     def __init__(self, path, start, end):
-        args = [
-            'ffmpeg',
-            '-threads', '2',
-            '-async', '1',
-            # video and audio are usually the first channels sometimes commentary is
-            # picked instead by ffmpeg if these streams aren't explicitly set
-            # there's no guarantee of video or audio stream ordering, so can't explicitly map
-            #~ '-map', '0.0',
-            #~ '-map', '0.1',
-        ]
-        if start:
-            args += ['-ss', start]
-        if end:
-            if start:
-                args += ['-t', str(dlna_npt_sec(end) - dlna_npt_sec(start))]
-            else:
-                args += ['-t', end]
-        args += [
-            '-i', path,
-            # '-target', 'pal-dvd', # or film?
-            '-vcodec', 'mpeg2video',
-            '-sameq',
-            # forcing a channel count is sometimes required due to audio encoding
-            '-acodec', 'ac3', '-ab', '192k', '-ac', '2',
-            '-f', 'mpegts',
-            '-y', '/dev/stdout'
-        ]
-        self.args = args
+        self.args = ['./transcode', path]
+        self.args.append(str(dlna_npt_sec(start)) if start else start)
+        self.args.append(str(dlna_npt_sec(end)) if end else end)
         self._stderr_thread = threading.Thread(target=self._log_stderr)
-        logging.debug('Starting transcoder with arguments: %r', args)
+        logging.debug('Starting transcoder with arguments: %r', self.args)
         try:
             self._child = subprocess.Popen(
-                args,
+                self.args,
                 stdin=open(os.devnull, 'rb'),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -789,7 +747,8 @@ class ResourceRequestHandler:
             return self.resource.length is not None
         finally:
             self.destroy()
-            thread.join()
+            if thread.is_alive():
+                thread.join()
 
 
 class BufferRequestHandler:
