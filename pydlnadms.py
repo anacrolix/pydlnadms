@@ -71,7 +71,6 @@ Service = collections.namedtuple(
     'Service',
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
 RESOURCE_PATH = '/res'
-ICON_PATH = '/icon'
 # flags are in hex. trailing 24 zeroes, 26 are after the space
 # "DLNA.ORG_OP=" time-seek-range-supp bytes-range-header-supp
 #CONTENT_FEATURES = 'DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
@@ -347,7 +346,7 @@ class HTTPConnection:
             for service in SERVICE_LIST:
                 if path == service.SCPDURL:
                     return send_description(service.xmlDescription)
-            if path in [RESOURCE_PATH, ICON_PATH]:
+            if path in {RESOURCE_PATH}:
                 return ResourceRequestHandler()
             else:
                 raise self.HTTPException(http.client.NOT_FOUND)
@@ -454,6 +453,26 @@ def dlna_npt_sec(npt_time):
         return datetime.timedelta(hours=hours, minutes=mins, seconds=secs).total_seconds()
     else:
         return float(npt_time)
+
+
+class ThumbnailResource:
+
+    def __init__(self, path):
+        self._process = subprocess.Popen(
+            ['ffmpegthumbnailer',
+                '-i', path,
+                '-o', '/dev/stdout',
+                '-c', 'jpeg',
+                '-t', '30%'],
+            stdout=subprocess.PIPE,)
+
+    def read(self, count):
+        return self._process.stdout.read(count)
+
+    def close(self):
+        self._process.wait()
+
+    length = None
 
 
 class TranscodeResource:
@@ -668,7 +687,9 @@ class ResourceRequestHandler:
                 (TIMESEEKRANGE_DLNA_ORG, HTTPRangeField({'npt': npt_range})),
                 ('Content-type', 'video/mpeg'),]
         elif 'thumbnail' in request.query:
-            assert False, 'Yay!!'
+            self.resource = ThumbnailResource(path)
+            response_headers += [
+                ('Content-type', 'image/jpeg'),]
         else:
             content_features.support_range = True
             if 'Range' in request:
@@ -852,8 +873,8 @@ class ContentDirectoryService:
             etree.SubElement(element, 'upnp:icon').text = urllib.parse.urlunsplit((
                 self.res_scheme,
                 self.res_netloc,
-                ICON_PATH,
-                urllib.parse.urlencode({'path': path, 'thumbnail': 1}),
+                RESOURCE_PATH,
+                urllib.parse.urlencode({'path': path, 'thumbnail': '1'}),
                 None))
 
         # video res element
@@ -882,6 +903,21 @@ class ContentDirectoryService:
             from metadata_ff import res_data
             for attr, value in res_data(path).items():
                 res_elt.set(attr, str(value))
+
+        # icon res element
+        if not isdir:
+            # why the fuck does PNG_TN not work? what's so magical about JPEG_TN?
+            icon_res_element = etree.SubElement(
+                element,
+                'res',
+                protocolInfo='http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN')
+            icon_res_element.text = urllib.parse.urlunsplit((
+                self.res_scheme,
+                self.res_netloc,
+                RESOURCE_PATH,
+                urllib.parse.urlencode({'path': path, 'thumbnail': '1'}),
+                None))
+
         return etree.tostring(element, encoding='unicode')
 
     def path_to_object_id(root_path, path):
