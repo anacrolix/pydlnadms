@@ -2,6 +2,7 @@
 # filetype=python3
 
 import collections
+import concurrent.futures
 import datetime
 import errno
 from xml.etree import ElementTree as etree
@@ -82,10 +83,11 @@ CONTENTFEATURES_DLNA_ORG = 'contentFeatures.dlna.org'
 
 class DLNAContentFeatures:
 
-    def __init__(self):
+    def __init__(self, **initial):
         self.support_time_seek = False
         self.support_range = False
         self.transcoded = False
+        self.__dict__.update(initial)
 
     def __str__(self):
         return 'DLNA.ORG_OP={}{};DLNA.ORG_CI={};DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'.format(
@@ -641,6 +643,7 @@ class ResourceRequestHandler:
             self.resource)
 
     def _start_response(self, request):
+        '''Creates self.resource, and puts the response header in self.buffer'''
         path = request.query['path'][-1]
         response_headers = [
             ('Server', SERVER_FIELD),
@@ -766,7 +769,8 @@ class BufferRequestHandler:
 def soap_action_response(service_type, action_name, arguments):
     # some clients expect the xml version to be at the very start of the document
     # maybe it's part of XML, maybe those clients suck. i don't know. don't move it.
-    return '''<?xml version="1.0"?>
+    return '''\
+<?xml version="1.0"?>
 <s:Envelope
         xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
         s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -793,27 +797,36 @@ def didl_lite(content):
 
 class ContentDirectoryService:
 
+    Entry = collections.namedtuple('Entry', ['path', 'transcode', 'title', 'mimetype'])
+
     def __init__(self, root_id_path, res_scheme, res_netloc):
         self.root_id_path = root_id_path
         self.res_scheme = res_scheme
         self.res_netloc = res_netloc
 
+    def path_entries(self, path, name):
+        entry_path = os.path.join(path, name)
+        mimetype = guess_mimetype(entry_path)
+        entries = []
+        entry = self.Entry(path=entry_path, transcode=False, title=name, mimetype=mimetype)
+        entries.append(entry)
+        if mimetype and mimetype.split('/')[0] == 'video':
+            # forward slashes cannot be used in normal file names >:D
+            entries.append(entry._replace(transcode=True, title=name+'/transcode'))
+        return entries
+
     def list_dlna_dir(self, path):
-        '''Yields a sequence of Entry's'''
-        Entry = collections.namedtuple('Entry', ['path', 'transcode', 'title', 'mimetype'])
         try:
             names = os.listdir(path)
         except:
             logger.warning('Error listing directory: %s', sys.exc_info()[1])
-            names = []
-        for name in sorted(names, key=str.lower):
-            entry_path = os.path.join(path, name)
-            mimetype = guess_mimetype(entry_path)
-            entry = Entry(path=entry_path, transcode=False, title=name, mimetype=mimetype)
-            yield entry
-            if mimetype and mimetype.split('/')[0] == 'video':
-                # forward slashes cannot be used in normal file names >:D
-                yield entry._replace(transcode=True, title=name+'/transcode')
+        with concurrent.futures.ThreadPoolExecutor(20) as executor:
+            # this wants yield from itertools.chain.from_iterable... PEP 380
+            for result in executor.map(
+                    (lambda a: self.path_entries(*a)),
+                    ((path, name) for name in sorted(names, key=str.lower))):
+                for entry in result:
+                    yield entry
 
     #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
@@ -835,12 +848,15 @@ class ContentDirectoryService:
             class_elt.text = 'object.container.storageFolder'
         else:
             class_elt.text = 'object.item.videoItem'
+            # upnp:icon doesn't seem to work anyway, see the image/* res tag
             etree.SubElement(element, 'upnp:icon').text = urllib.parse.urlunsplit((
                 self.res_scheme,
                 self.res_netloc,
                 ICON_PATH,
                 urllib.parse.urlencode({'path': path, 'thumbnail': 1}),
                 None))
+
+        # video res element
         content_features = DLNAContentFeatures()
         if transcode:
             content_features.support_time_seek = True
@@ -857,7 +873,7 @@ class ContentDirectoryService:
             RESOURCE_PATH,
             urllib.parse.urlencode([('path', path)] + ([('transcode', '1')] if transcode else [])),
             None))
-        if not isdir:
+        if not isdir and not transcode:
             try:
                 res_elt.set('size', str(os.path.getsize(path)))
             except OSError as exc:
@@ -882,19 +898,18 @@ class ContentDirectoryService:
         else:
             return object_id
 
-    def Browse(self, BrowseFlag, StartingIndex, RequestedCount, ObjectID, Filter=None, SortCriteria=None):
-        '''(list of CD objects in XML, total possible elements)'''
+    def Browse(self, BrowseFlag, StartingIndex, RequestedCount, ObjectID,
+            Filter=None, SortCriteria=None):
         path = self.object_id_to_path(ObjectID)
         if BrowseFlag == 'BrowseDirectChildren':
             children = list(self.list_dlna_dir(path))
             start = int(StartingIndex)
-            count = int(RequestedCount)
-            end = len(children)
-            if count:
-                end = min(start + count, end)
-            result_elements = []
-            for index in range(start, end):
-                result_elements.append(self.object_xml(ObjectID, children[index]))
+            stop = start + int(RequestedCount)
+            with concurrent.futures.ThreadPoolExecutor(20) as executor:
+                result_elements = list(executor.map(
+                    self.object_xml,
+                    itertools.repeat(ObjectID),
+                    children[start:stop]))
             total_matches = len(children)
         else: # TODO check other flags
             parent_id = path_to_object_id(os.path.normpath(os.path.split(path)[0]))
@@ -950,7 +965,8 @@ class SOAPRequestHandler:
         out_args = getattr(self, 'soap_' + self.action)(**in_args)
         response_body = soap_action_response(
             self.service_type,
-            self.action, out_args.items()).encode('utf-8')
+            self.action,
+            out_args.items()).encode('utf-8')
         buffer = HTTPResponse([
             ('CONTENT-LENGTH', str(len(response_body))),
             ('CONTENT-TYPE', 'text/xml; charset="utf-8"'),
