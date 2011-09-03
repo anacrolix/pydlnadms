@@ -845,6 +845,7 @@ class ContentDirectoryService:
             names = os.listdir(path)
         except:
             logger.warning('Error listing directory: %s', sys.exc_info()[1])
+            return
         with concurrent.futures.ThreadPoolExecutor(20) as executor:
             # this wants yield from itertools.chain.from_iterable... PEP 380
             for result in executor.map(
