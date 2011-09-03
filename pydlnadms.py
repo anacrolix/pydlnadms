@@ -71,6 +71,7 @@ Service = collections.namedtuple(
     'Service',
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
 RESOURCE_PATH = '/res'
+ICON_PATH = '/icon'
 # flags are in hex. trailing 24 zeroes, 26 are after the space
 # "DLNA.ORG_OP=" time-seek-range-supp bytes-range-header-supp
 #CONTENT_FEATURES = 'DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000000000'
@@ -346,7 +347,7 @@ class HTTPConnection:
             for service in SERVICE_LIST:
                 if path == service.SCPDURL:
                     return send_description(service.xmlDescription)
-            if path in {RESOURCE_PATH}:
+            if path in {RESOURCE_PATH, ICON_PATH}:
                 return ResourceRequestHandler()
             else:
                 raise self.HTTPException(http.client.NOT_FOUND)
