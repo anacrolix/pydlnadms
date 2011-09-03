@@ -463,7 +463,8 @@ class ThumbnailResource:
                 '-i', path,
                 '-o', '/dev/stdout',
                 '-c', 'jpeg',
-                '-t', '30%'],
+                #~ '-t', '30%'
+            ],
             stdout=subprocess.PIPE,)
 
     def read(self, count):
