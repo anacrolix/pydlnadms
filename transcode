@@ -50,7 +50,8 @@ args += [
     #~ '-acodec', 'ac3', '-ab', '192k', '-ac', '2',
     '-acodec', 'copy',
     '-f', 'mpegts',
-    '-y', '/dev/stdout'
+    #~ '-y', '/dev/stdout'
+    'pipe:',
 ]
 
 import os
