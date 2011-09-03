@@ -819,6 +819,8 @@ def didl_lite(content):
 class ContentDirectoryService:
 
     Entry = collections.namedtuple('Entry', ['path', 'transcode', 'title', 'mimetype'])
+    from metadata_ff import res_data
+    res_data = staticmethod(res_data)
 
     def __init__(self, root_id_path, res_scheme, res_netloc):
         self.root_id_path = root_id_path
@@ -900,8 +902,7 @@ class ContentDirectoryService:
             except OSError as exc:
                 logging.warning('%s', exc)
         if not transcode:
-            from metadata_ff import res_data
-            for attr, value in res_data(path).items():
+            for attr, value in self.res_data(path).items():
                 res_elt.set(attr, str(value))
 
         # icon res element
@@ -1411,7 +1412,7 @@ def main():
         '-p', '--port', type='int', default=1337,
         help='media server listen PORT')
     parser.add_option(
-        '--logging_conf',
+        '--logging_conf', '--logging-conf',
         help='Path of Python logging configuration file')
     parser.add_option('--notify-interval', '-n', type='int', default=895,
         help='time in seconds between server advertisements on the network')
