@@ -862,6 +862,8 @@ class ContentDirectoryService:
         transcode = cdentry.transcode
         title = cdentry.title
         isdir = os.path.isdir(path)
+        type, subtype = cdentry.mimetype.split('/')
+
         element = etree.Element(
             'container' if isdir else 'item',
             id=path, parentID=parent_id, restricted='1')
@@ -869,11 +871,12 @@ class ContentDirectoryService:
         if isdir:
             element.set('childCount', str(sum(1 for e in self.list_dlna_dir(path))))
         etree.SubElement(element, 'dc:title').text = title
+
         class_elt = etree.SubElement(element, 'upnp:class')
         if isdir:
             class_elt.text = 'object.container.storageFolder'
         else:
-            class_elt.text = 'object.item.videoItem'
+            class_elt.text = 'object.item.{type}Item'.format(**vars())
             # upnp:icon doesn't seem to work anyway, see the image/* res tag
             etree.SubElement(element, 'upnp:icon').text = urllib.parse.urlunsplit((
                 self.res_scheme,
@@ -909,7 +912,7 @@ class ContentDirectoryService:
                 res_elt.set(attr, str(value))
 
         # icon res element
-        if not isdir:
+        if type in {'video', 'image'}:
             # why the fuck does PNG_TN not work? what's so magical about JPEG_TN?
             icon_res_element = etree.SubElement(
                 element,
