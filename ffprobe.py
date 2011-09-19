@@ -19,7 +19,7 @@ def parse_stdout(lines):
     for l in lines:
         section = re.match(r'\[(.+)\]', l).group(1)
         options = dict(parse_section(lines, section))
-        index = options.pop('index', None)
+        index = options.get('index')
         if index is None:
             assert section not in retval, section
             retval[section] = options
