@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import pdb
+import pprint
+import sys
+
+class main:
+
+    def __init__(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--debug', default=False, action='store_true')
+        parser.add_argument('path')
+        parser.add_argument('start', nargs='?')
+        parser.add_argument('end', nargs='?')
+        namespace = parser.parse_args()
+        self.debug = namespace.debug
+        self.path = namespace.path
+        self.start = namespace.start
+        self.end = namespace.end
+        self.ffmpeg()
+
+    def ffmpeg(self):
+        start = self.start
+        end = self.end
+        path = self.path
+        args = [
+            'ffmpeg',
+            '-threads', '4',
+            '-async', '1',
+        ]
+        # putting time position before the input argument improves the initial seek time
+        if start:
+            args += ['-ss', start]
+        if end:
+            if start:
+                args += ['-t', str(float(end) - float(start))]
+            else:
+                args += ['-t', end]
+        args += [
+            '-i', path,
+            #~ '-vcodec', 'mpeg2video',
+            #~ '-b'
+            #~ '-sameq',
+            #~ '-aspect', '16:9',
+            #~ '-s', '1280x720',
+        ]
+        # forcing a channel count is sometimes required due to audio encoding
+        import ffprobe
+        from collections import OrderedDict
+
+        def stream_args(stream):
+            args = None
+            if stream['codec_type'] == 'video':
+                args = ['-target', 'pal-dvd'] # or film?
+            if stream['codec_type'] == 'audio':
+                if stream['codec_name'] == 'dca':
+                #~ if False:
+                    # copying dca seems to break ffmpeg, so lets recode it
+                    args = ['-acodec', 'ac3', '-ab', '192k', '-ac', '2']
+                else:
+                    args = ['-acodec', 'copy']
+            if stream['codec_type'] == 'subtitle':
+                if stream['codec_name'] != 'unknown':
+                    args = ['-scodec', 'copy']
+            if args is not None:
+                args += ['-map', '0.' + stream['index']]
+            return args
+
+        streams = ffprobe.ffprobe(path)['STREAM']
+
+        x = OrderedDict()
+        for s in streams:
+            sa = stream_args(s)
+            if sa is None:
+                continue
+            x.setdefault(s['codec_type'], []).append((s, sa))
+        x['audio'].sort(key=(lambda e: e[0].get('TAG:language') == 'eng'), reverse=True)
+
+        pprint.pprint(list(x.values()), stream=sys.stderr)
+        #~ pdb.set_trace()
+
+        for l in x.values():
+            args += l[0][1]
+
+        args += ['-f', 'mpegts', 'pipe:']
+
+        for ct, l in x.items():
+            for s, sa in l[1:]:
+                args += sa + ['-new'+ct]
+
+
+        print('Execing {args!r}'.format(**vars()), file=sys.stderr)
+        if self.debug:
+            return
+        sys.stderr.flush() # flush that bitch
+        #~ sys.exit()
+
+        import os
+        os.execvp(args[0], args)
+
+
+main()
+
+# alternate transcoder arguments
+
+#elif False: pass
+    #args = ['mencoder']
+    # -ss and -endpos (not relative)
+    #~ '-oac', 'lavc', '-ovc', 'lavc', '-of', 'mpegts', '-mpegopts',
+    #~ 'format=dvd:tsaf', '-vf', 'scale=720:576,harddup', '-srate', '48000',
+    #~ '-af', 'lavcresample=48000', '-lavcopts',
+    #~ 'vcodec=mpeg2video:vrc_buf_size=1835:vrc_maxrate=9800:vbitrate=5000:keyint=15:vstrict=0:acodec=ac3:abitrate=192:aspect=16/9', '-ofps', '25',
+    #~ '-o', '/dev/stdout', path
+#elif False: pass
+    #~ args = ['vlc', '-I', 'dummy']
+    #~ args += [
+        #~ '--sout', '#transcode{vcodec=mp2v,fps=24,vb=6000}:std{mux=ts,access=file,dst=/dev/stdout}',
+    # --start-time and --end-time (relative)
+        #~ path,
