@@ -93,7 +93,7 @@ class HandleRequest:
                 else:
                     return handlers.file_resource
             else:
-                return handlers.error(http.client.NOT_FOUND)
+                return partial(handlers.error, http.client.NOT_FOUND)
         elif method in {'POST'}:
             if path in (service.controlURL for service in SERVICE_LIST):
                 return handlers.service
