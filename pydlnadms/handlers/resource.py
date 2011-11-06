@@ -64,17 +64,29 @@ def transcode_resource(context):
         close_fds=True)
 
 def thumbnail_resource(context):
-    resource = ThumbnailResource(context.request.query['path'][-1])
-    context.start_response(200, [('Content-Type', 'image/jpeg')])
     import subprocess, os
-    subprocess.check_call([
-            'ffmpegthumbnailer',
-            '-i', path,
-            '-o', '/dev/stdout',
-            '-c', 'jpeg',],
-        stdin=open(os.devnull, 'rb'),
-        stdout=context.socket,
-        close_fds=True)
+    with subprocess.Popen([
+                    'ffmpegthumbnailer',
+                    '-i', context.request.query['path'][-1],
+                    '-o', '/dev/stdout',
+                    '-c', 'jpeg',],
+                stdin=open(os.devnull, 'rb'),
+                # ffmpegthumbnailer fails if stdout is a socket
+                # Error: Failed to open output file: /dev/stdout
+                stdout=subprocess.PIPE,
+                close_fds=True
+            ) as process:
+        context.start_response(206, [
+                ('Content-Type', 'image/jpeg'),
+                ('Ext', None),
+                ('transferMode.dlna.org', 'Streaming'),
+                (CONTENTFEATURES_DLNA_ORG, DLNAContentFeatures()),
+            ])
+        while True:
+            buf = process.stdout.read(0x10000)
+            if not buf:
+                break
+            context.socket.sendall(buf)
 
 def file_resource(context):
     request = context.request
