@@ -33,8 +33,9 @@ def recv_http_header(sock):
         # determine bufsize so that body is left in the socket
         #
         peek_data = sock.recv(0x1000, socket.MSG_PEEK)
+        if not peek_data:
+            return buffer
         index = (buffer + peek_data).find(HTTP_BODY_SEPARATOR)
-        assert index >= -1, index
         if index == -1:
             bufsize = len(peek_data)
         else:
@@ -43,14 +44,12 @@ def recv_http_header(sock):
 
         data = sock.recv(bufsize)
         assert data == peek_data[:bufsize], (data, peek_data)
-        if not data:
-            return buffer
         buffer += data
 
         if index != -1:
+            assert buffer.endswith(HTTP_BODY_SEPARATOR)
             break
-    assert buffer.count(HTTP_BODY_SEPARATOR) == 1
-    assert buffer.endswith(HTTP_BODY_SEPARATOR)
+    assert buffer.count(HTTP_BODY_SEPARATOR) <= 1
     return buffer
 
 from http.client import HTTPException
@@ -69,7 +68,9 @@ class HandleRequest:
             ('Server', SERVER_FIELD),
             ('Date', rfc1123_date())
         ] + headers
-        self.socket.sendall(HTTPResponse(headers, code=code).to_bytes())
+        bytes = HTTPResponse(headers, code=code).to_bytes()
+        logging.debug('%s', bytes)
+        self.socket.sendall(bytes)
         return self.socket
 
     def get_handler(self, request):
