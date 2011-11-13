@@ -3,7 +3,7 @@ from .server import *
 import select, socket, logging, random
 
 logger = logging.getLogger('ssdp')
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 
 EXPIRY_FUDGE = 5
 SSDP_PORT = 1900

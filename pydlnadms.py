@@ -38,7 +38,7 @@ def main():
         handler = logging.StreamHandler()
         handler.setFormatter(formatter)
         logger = logging.getLogger()
-        logger.setLevel(logging.NOTSET)
+        logger.setLevel(logging.INFO)
         logger.addHandler(handler)
     else:
         logging.config.fileConfig(opts.logging_conf, disable_existing_loggers=False)
