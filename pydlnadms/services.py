@@ -1,7 +1,6 @@
 from xml.etree import ElementTree as etree
 from xml.sax.saxutils import escape as xml_escape
 import collections
-import concurrent.futures
 import itertools
 import logging
 import mimetypes
@@ -81,11 +80,14 @@ for service, domain, version, actions, statevars in [
 
 from .misc import guess_mimetype
 
+import concurrent.futures
+thread_pool = concurrent.futures.ThreadPoolExecutor(50)
+
+from ffprobe import res_data
 
 class ContentDirectoryService:
 
     Entry = collections.namedtuple('Entry', ['path', 'transcode', 'title', 'mimetype'])
-    from metadata_ff import res_data
     res_data = staticmethod(res_data)
 
     def __init__(self, root_id_path, res_scheme, res_netloc, res_path):
@@ -112,13 +114,12 @@ class ContentDirectoryService:
         except:
             logger.warning('Error listing directory: %s', sys.exc_info()[1])
             return
-        with concurrent.futures.ThreadPoolExecutor(20) as executor:
-            # this wants yield from itertools.chain.from_iterable... PEP 380
-            for result in executor.map(
-                    (lambda a: self.path_entries(*a)),
-                    ((path, name) for name in sorted(names, key=str.lower))):
-                for entry in result:
-                    yield entry
+        # this wants yield from itertools.chain.from_iterable... PEP 380
+        for result in map(
+                (lambda a: self.path_entries(*a)),
+                ((path, name) for name in sorted(names, key=str.lower))):
+            for entry in result:
+                yield entry
 
     #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
 
@@ -215,11 +216,10 @@ class ContentDirectoryService:
             children = list(self.list_dlna_dir(path))
             start = int(StartingIndex)
             stop = (start + RequestedCount) if RequestedCount else None
-            with concurrent.futures.ThreadPoolExecutor(20) as executor:
-                result_elements = list(executor.map(
-                    self.object_xml,
-                    itertools.repeat(ObjectID),
-                    children[start:stop]))
+            result_elements = list(thread_pool.map(
+                self.object_xml,
+                itertools.repeat(ObjectID),
+                children[start:stop]))
             total_matches = len(children)
         else: # TODO check other flags
             parent_id = path_to_object_id(os.path.normpath(os.path.split(path)[0]))
