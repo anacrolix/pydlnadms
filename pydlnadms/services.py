@@ -81,7 +81,7 @@ for service, domain, version, actions, statevars in [
 from .misc import guess_mimetype
 
 import concurrent.futures
-thread_pool = concurrent.futures.ThreadPoolExecutor(50)
+thread_pool = concurrent.futures.ThreadPoolExecutor(20)
 
 from ffprobe import res_data
 
@@ -99,26 +99,22 @@ class ContentDirectoryService:
     def path_entries(self, path, name):
         entry_path = os.path.join(path, name)
         mimetype = guess_mimetype(entry_path)
-        entries = []
         entry = self.Entry(path=entry_path, transcode=False, title=name, mimetype=mimetype)
-        entries.append(entry)
+        yield entry
         if mimetype and mimetype.split('/')[0] == 'video':
             # forward slashes cannot be used in normal file names >:D
-            entries.append(entry._replace(transcode=True, title=name+'/transcode'))
-        return entries
+            yield entry._replace(transcode=True, title=name+'/transcode')
 
     def list_dlna_dir(self, path):
         '''Yields entries to be shown for the given path with the metadata obtained while processing them.'''
         try:
             names = os.listdir(path)
-        except:
-            logger.warning('Error listing directory: %s', sys.exc_info()[1])
+        except Exception as exc:
+            logger.warning('Error listing directory: %s', exc)
             return
         # this wants yield from itertools.chain.from_iterable... PEP 380
-        for result in map(
-                (lambda a: self.path_entries(*a)),
-                ((path, name) for name in sorted(names, key=str.lower))):
-            for entry in result:
+        for name in sorted(names, key=str.lower):
+            for entry in self.path_entries(path, name):
                 yield entry
 
     #<res size="1468606464" duration="1:57:48.400" bitrate="207770" sampleFrequency="48000" nrAudioChannels="6" resolution="656x352" protocolInfo="http-get:*:video/avi:DLNA.ORG_OP=01;DLNA.ORG_CI=0">http://192.168.24.8:8200/MediaItems/316.avi</res>
@@ -136,7 +132,7 @@ class ContentDirectoryService:
             id=path, parentID=parent_id, restricted='1')
         # despite being optional, VLC requires childCount to browse subdirectories
         if isdir:
-            element.set('childCount', str(sum(1 for e in self.list_dlna_dir(path))))
+            element.set('childCount', str(sum(1 for _ in self.list_dlna_dir(path))))
         etree.SubElement(element, 'dc:title').text = title
 
         class_elt = etree.SubElement(element, 'upnp:class')
@@ -174,7 +170,7 @@ class ContentDirectoryService:
                 res_elt.set('size', str(os.path.getsize(path)))
             except OSError as exc:
                 logging.warning('%s', exc)
-        if not transcode:
+        if not isdir:
             for attr, value in self.res_data(path).items():
                 res_elt.set(attr, str(value))
 
@@ -223,11 +219,12 @@ class ContentDirectoryService:
             total_matches = len(children)
         else: # TODO check other flags
             parent_id = path_to_object_id(os.path.normpath(os.path.split(path)[0]))
-            result_elements = [
-                self.object_xml(parent_id, path, '??ROOT??', None)
-            ]
+            result_elements = [self.object_xml(parent_id, path, '??ROOT??', None)]
             total_matches = 1
-        logging.debug('ContentDirectory::Browse result:\n%s', pprint.pformat(result_elements))
+        if logging.root.isEnabledFor(logging.DEBUG):
+            logging.debug(
+                'ContentDirectory::Browse result:\n%s',
+                pprint.pformat(result_elements))
         return dict(
             Result=xml_escape(didl_lite(''.join(result_elements))),
             NumberReturned=len(result_elements),

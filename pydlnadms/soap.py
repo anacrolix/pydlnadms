@@ -41,6 +41,7 @@ def get_soap_request(http_request):
 def soap_action_response_body(service_type, action_name, arguments):
     # some clients expect the xml version to be at the very start of the document
     # maybe it's part of XML, maybe those clients suck. i don't know. don't move it.
+    # addendum: apparently a leading backslash makes this work. don't move THAT.
     return '''\
 <?xml version="1.0"?>
 <s:Envelope
