@@ -10,7 +10,7 @@ ROOT_DEVICE_MANUFACTURER = 'Matt Joiner'
 DEVICE_DESC_SERVICE_FIELDS = 'serviceType', 'serviceId', 'SCPDURL', 'controlURL', 'eventSubURL'
 
 def make_device_desc(udn):
-    from xml.etree.ElementTree import Element, tostring, SubElement
+    from xml.etree.cElementTree import Element, tostring, SubElement
     root = Element('root', xmlns='urn:schemas-upnp-org:device-1-0')
     specVersion = SubElement(root, 'specVersion')
     SubElement(specVersion, 'major').text = '1'

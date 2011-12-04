@@ -1,4 +1,4 @@
-from xml.etree import ElementTree as etree
+from xml.etree import cElementTree as etree
 from xml.sax.saxutils import escape as xml_escape
 import collections
 import itertools
@@ -20,7 +20,7 @@ Service = collections.namedtuple(
     DEVICE_DESC_SERVICE_FIELDS + ('xmlDescription',))
 
 def make_xml_service_description(actions, statevars):
-    from xml.etree.ElementTree import Element, tostring, SubElement
+    from xml.etree.cElementTree import Element, tostring, SubElement
     scpd = Element('scpd', xmlns='urn:schemas-upnp-org:service-1-0')
     specVersion = SubElement(scpd, 'specVersion')
     SubElement(specVersion, 'major').text = '1'
