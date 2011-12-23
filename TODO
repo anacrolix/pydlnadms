@@ -3,3 +3,4 @@
  * add a profiling option? profile the ffprobe/res_data threads
  * prefetch directory object_xml data?
  * look into weakref sets?
+ * remove traceback on transcode failure
