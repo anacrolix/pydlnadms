@@ -57,11 +57,14 @@ def transcode_resource(context):
         str(dlna_npt_to_seconds(start)) if start else start,
         str(dlna_npt_to_seconds(end)) if end else end]
     import subprocess, os
-    subprocess.check_call(
-        transcoder_args,
-        stdin=open(os.devnull, 'rb'),
-        stdout=context.socket,
-        close_fds=True)
+    try:
+        subprocess.check_call(
+            transcoder_args,
+            stdin=open(os.devnull, 'rb'),
+            stdout=context.socket,
+            close_fds=True)
+    except subprocess.CalledProcessError as exc:
+        logging.warning('Transcoder error: %s', exc)
 
 def thumbnail_resource(context):
     import subprocess, os
