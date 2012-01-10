@@ -4,3 +4,4 @@
  * prefetch directory object_xml data?
  * look into weakref sets?
  * remove traceback on transcode failure
+ * try putting a fifo in the media dir to stream the computers screen, or add a special file to this effect
