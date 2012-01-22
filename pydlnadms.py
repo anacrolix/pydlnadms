@@ -46,6 +46,7 @@ def main():
 
     path = namespace.path
     if path is None:
+        import os
         path = os.curdir
     import os.path
     path = os.path.normpath(path)
