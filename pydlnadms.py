@@ -41,7 +41,7 @@ def main():
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)
     else:
-        logging.config.fileConfig(opts.logging_conf, disable_existing_loggers=False)
+        logging.config.fileConfig(namespace.logging_conf, disable_existing_loggers=False)
     logger = logging.getLogger('pydlnadms.main')
 
     path = namespace.path
