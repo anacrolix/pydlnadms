@@ -17,7 +17,7 @@ def fix_etree_to_string():
 def main():
     from argparse import ArgumentParser
     parser = ArgumentParser(
-        usage='%prog [options] [PATH]',
+        usage='%(prog)s [options] [PATH]',
         description='Serves media from the given PATH over UPnP-AV and DLNA.')
     parser.add_argument(
         '-p', '--port', type=int, default=1337,
