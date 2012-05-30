@@ -147,10 +147,8 @@ class HTTPServer:
         return sock
 
     def handle_client(self, sock):
-        try:
+        with sock:
             HandleRequest(sock, self.dms)()
-        finally:
-            sock.close()
 
     def run(self):
         import threading

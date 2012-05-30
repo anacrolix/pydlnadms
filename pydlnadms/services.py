@@ -177,6 +177,7 @@ class ContentDirectoryService:
         # icon res element
         if type in {'video', 'image'}:
             # why the fuck does PNG_TN not work? what's so magical about JPEG_TN?
+            # answer: it's because PNG isn't a supported profile for Panasonic Viera
             icon_res_element = etree.SubElement(
                 element,
                 'res',

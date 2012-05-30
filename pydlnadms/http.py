@@ -42,6 +42,9 @@ class HTTPRequest:
     def __getitem__(self, key):
         return self.headers[key.upper()]
 
+    def get(self, key):
+        return self.headers.get(key.upper())
+
     def __contains__(self, key):
         return key.upper() in self.headers
 

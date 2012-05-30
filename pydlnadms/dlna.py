@@ -1,5 +1,6 @@
 TIMESEEKRANGE_DLNA_ORG = 'TimeSeekRange.dlna.org'
 CONTENTFEATURES_DLNA_ORG = 'contentFeatures.dlna.org'
+TRANSFERMODE_DLNA_ORG = 'transferMode.dlna.org'
 
 # flags are in hex. trailing 24 zeroes, 26 are after the space
 # "DLNA.ORG_OP=" time-seek-range-supp bytes-range-header-supp
