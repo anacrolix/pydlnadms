@@ -101,8 +101,7 @@ class main:
         sys.stderr.flush() # flush that bitch
         #~ sys.exit()
 
-        import os
-        os.execvp(args[0], args)
+        raise SystemExit(subprocess.Popen(args).wait())
 
 
 main()
