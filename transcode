@@ -59,19 +59,22 @@ class main:
         def stream_args(stream):
             args = None
             if stream['codec_type'] == 'video':
-                args = ['-target', 'pal-dvd'] # or film?
-            if stream['codec_type'] == 'audio':
+                if stream['codec_name'] == 'h264' and int(stream['is_avc']):
+                    args = ['-vcodec', 'copy', '-sameq', '-vbsf', 'h264_mp4toannexb']
+                else:
+                    args = ['-target', 'pal-dvd'] # or film?
+            elif stream['codec_type'] == 'audio':
                 if stream['codec_name'] == 'dca':
                 #~ if False:
                     # copying dca seems to break ffmpeg, so lets recode it
-                    args = ['-acodec', 'ac3', '-ab', '192k', '-ac', '2']
+                    args = ['-acodec', 'ac3', '-ab', '224k', '-ac', '2']
                 else:
                     args = ['-acodec', 'copy']
-            if stream['codec_type'] == 'subtitle':
+            elif stream['codec_type'] == 'subtitle':
                 if stream['codec_name'] != 'unknown':
                     args = ['-scodec', 'copy']
             if args is not None:
-                args += ['-map', '0.' + stream['index']]
+                args += ['-map', '0:' + stream['index']]
             return args
 
         streams = ffprobe.ffprobe(path)['STREAM']
