@@ -1,6 +1,6 @@
 from .http import *
 from .server import *
-import select, socket, logging, random
+import select, socket, logging, random, struct
 
 logger = logging.getLogger('ssdp')
 logger.setLevel(logging.INFO)
@@ -62,18 +62,16 @@ class SSDPAdvertiser:
 
     @property
     def notify_interfaces(self):
-        from getifaddrs import getifaddrs, IFF_LOOPBACK
-        from socket import AF_INET
-        for ifaddr in getifaddrs():
-            if ifaddr.family == AF_INET: #and not ifaddr.flags & IFF_LOOPBACK:
-                yield ifaddr.family, ifaddr.addr
+        yield socket.AF_INET, ('192.168.26.2', 0)
 
     def ssdp_multicast(self, family, addr, buf):
         s = socket.socket(family, socket.SOCK_DGRAM)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, False)
-        s.bind((addr[0], 0)) # to the interface on any port
+        s.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_LOOP, False)
+        s.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_IF, b'\0'*4)
+        #~ s.bind(('', 0)) # to the interface on any port
+        s.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_TTL, 4)
         s.sendto(buf, (SSDP_MCAST_ADDR, SSDP_PORT))
-        s.close()
+        s.close() 
 
     def notify_byebye(self):
         for nt in self.dms.all_targets:
@@ -188,31 +186,32 @@ class SSDPResponder:
         self.socket = s
         self.events = Events()
         self.dms = dms
-        self.update_multicast_membership()
+        #~ self.update_multicast_membership()
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(SSDP_MCAST_ADDR) + struct.pack('I', socket.INADDR_ANY))
 
-    def update_multicast_membership(self):
-        from getifaddrs import getifaddrs
-        import struct, errno
-        try:
-            for ifaddr in getifaddrs():
-                if ifaddr.family == self.socket.family:
-                    self.logger.debug(
-                        'Adding SSDPResponder socket to multicast group on interface %r',
-                        ifaddr.addr[0],)
-                    mreqn = struct.pack(
-                        '4s4si',
-                        socket.inet_aton(SSDP_MCAST_ADDR),
-                        socket.inet_aton(ifaddr.addr[0]),
-                        0)
-                    try:
-                        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreqn)
-                    except socket.error as exc:
-                        if exc.errno == errno.EADDRINUSE:
-                            self.logger.debug(exc)
-                        else:
-                            self.logger.exception(exc)
-        finally:
-            self.events.add(self.update_multicast_membership, delay=15)
+    #~ def update_multicast_membership(self):
+        #~ from getifaddrs import getifaddrs
+        #~ import struct, errno
+        #~ try:
+            #~ for ifaddr in getifaddrs():
+                #~ if ifaddr.family == self.socket.family:
+                    #~ self.logger.debug(
+                        #~ 'Adding SSDPResponder socket to multicast group on interface %r',
+                        #~ ifaddr.addr[0],)
+                    #~ mreqn = struct.pack(
+                        #~ '4s4si',
+                        #~ socket.inet_aton(SSDP_MCAST_ADDR),
+                        #~ socket.inet_aton(ifaddr.addr[0]),
+                        #~ 0)
+                    #~ try:
+                        #~ self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreqn)
+                    #~ except socket.error as exc:
+                        #~ if exc.errno == errno.EADDRINUSE:
+                            #~ self.logger.debug(exc)
+                        #~ else:
+                            #~ self.logger.exception(exc)
+        #~ finally:
+            #~ self.events.add(self.update_multicast_membership, delay=15)
 
     def run(self):
         while True:

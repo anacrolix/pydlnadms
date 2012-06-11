@@ -3,7 +3,7 @@
 import errno
 import logging
 logger = logging.getLogger()
-from resource import setrlimit, RLIMIT_CPU
+import os
 import re
 from subprocess import Popen, PIPE, CalledProcessError, list2cmdline
 
@@ -29,18 +29,25 @@ def parse_stdout(lines):
             retval[section].append(options)
     return retval
 
-def preexec_fn():
-    # give the process 1 second, 2 if it treats SIGXCPU
-    setrlimit(RLIMIT_CPU, (1, 2))
+if os.name == 'nt':
+    preexec_fn = None
+else:
+    from resource import setrlimit, RLIMIT_CPU
+    def preexec_fn():
+        # give the process 1 second, 2 if it treats SIGXCPU
+        setrlimit(RLIMIT_CPU, (1, 2))
 
+if os.name == 'nt':
+    ffprobe_path = r'F:\ffmpeg-20120601-git-8a0efa9-win32-static\bin\ffprobe.exe'
+else:
+    ffprobe_path = 'ffprobe'
 def ffprobe(path):
-    args = ['ffprobe', '-show_format', '-show_streams', path]
+    args = [ffprobe_path, '-show_format', '-show_streams', path]
     process = Popen(
         args,
         stdout=PIPE,
         stderr=PIPE,
-        preexec_fn=preexec_fn,
-        close_fds=True)
+        preexec_fn=preexec_fn,)
     stdout, stderr = process.communicate()
     if process.returncode != 0:
         raise CalledProcessError(process.returncode, args)

@@ -1,8 +1,11 @@
 from ..dlna import *
 from ..resources import *
 from ..http import *
-
 from ..misc import guess_mimetype
+
+import os
+import subprocess
+
 
 class DLNAResponse:
 
@@ -52,19 +55,18 @@ def transcode_resource(context):
     start = npt_range.start
     end = npt_range.end
     transcoder_args = [
+        r'c:\python32\python' if os.name == 'nt' else 'python3',
         './transcode',
+        # 'transcode.bat',
         request.query['path'][-1],
         str(dlna_npt_to_seconds(start)) if start else start,
         str(dlna_npt_to_seconds(end)) if end else end]
-    import subprocess, os
-    try:
-        subprocess.check_call(
-            transcoder_args,
-            stdin=open(os.devnull, 'rb'),
-            stdout=context.socket,
-            close_fds=True)
-    except subprocess.CalledProcessError as exc:
-        logging.warning('Transcoder error: %s', exc)
+    with subprocess.Popen(transcoder_args, stdout=subprocess.PIPE) as p:
+        while True:
+            b = p.stdout.read(0x20000)
+            if not b:
+                break
+            context.socket.sendall(b)
 
 def thumbnail_resource(context):
     import subprocess, os
@@ -77,7 +79,7 @@ def thumbnail_resource(context):
                 # ffmpegthumbnailer fails if stdout is a socket
                 # Error: Failed to open output file: /dev/stdout
                 stdout=subprocess.PIPE,
-                close_fds=True
+                close_fds=(False if os.name == 'nt' else True)
             ) as process:
         context.start_response(206, [
                 ('Content-Type', 'image/jpeg'),

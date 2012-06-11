@@ -7,6 +7,16 @@ from ..server import RESOURCE_PATH
 def service(*args, **kwargs):
     return ServiceRequestHandler()(*args, **kwargs)
 
+def recvall(sock, count):
+    bufs = []
+    while count > 0:
+        b = sock.recv(count)
+        if not b:
+            break
+        bufs.append(b)
+        count -= len(b)
+    return b''.join(bufs)
+    
 
 class ServiceRequestHandler:
 
@@ -15,9 +25,7 @@ class ServiceRequestHandler:
         self.dms = context.dms
         self.request = context.request
         soap_request_args = get_soap_request_args(
-            context.socket.recv(
-                soap_request.content_length,
-                socket.MSG_WAITALL),
+            recvall(context.socket, soap_request.content_length),
             soap_request.service_type,
             soap_request.action,)
         response_soap_args = getattr(self, 'soap_' + soap_request.action)(**soap_request_args)
