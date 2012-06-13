@@ -58,9 +58,11 @@ def transcode_resource(context):
         r'c:\python32\python' if os.name == 'nt' else 'python3',
         './transcode',
         # 'transcode.bat',
-        request.query['path'][-1],
-        str(dlna_npt_to_seconds(start)) if start else start,
-        str(dlna_npt_to_seconds(end)) if end else end]
+        request.query['path'][-1],]
+    if start:
+        transcoder_args += ['-ss', start]
+    if end:
+        transcoder_args += ['-t', str(dlna_npt_to_seconds(end) - dlna_npt_to_seconds(start))]
     with subprocess.Popen(transcoder_args, stdout=subprocess.PIPE) as p:
         while True:
             b = p.stdout.read(0x20000)

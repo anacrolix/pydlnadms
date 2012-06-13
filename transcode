@@ -15,21 +15,21 @@ class main:
         parser = argparse.ArgumentParser()
         parser.add_argument('--debug', default=False, action='store_true')
         parser.add_argument('path')
-        parser.add_argument('start', nargs='?')
-        parser.add_argument('end', nargs='?')
+        parser.add_argument('-ss')
+        parser.add_argument('-t')
         namespace = parser.parse_args()
         self.debug = namespace.debug
         self.path = namespace.path
-        self.start = namespace.start
-        self.end = namespace.end
+        self.ss = namespace.ss
+        self.t = namespace.t
         logging.basicConfig(
             level=logging.DEBUG if self.debug else logging.INFO,
             stream=sys.stderr)
         self.ffmpeg()
 
     def ffmpeg(self):
-        start = self.start
-        end = self.end
+        ss = self.ss
+        t = self.t
         path = self.path
         args = [
             'ffmpeg',
@@ -37,13 +37,10 @@ class main:
             '-async', '1',
         ]
         # putting time position before the input argument improves the initial seek time
-        if start:
-            args += ['-ss', start]
-        if end:
-            if start:
-                args += ['-t', str(float(end) - float(start))]
-            else:
-                args += ['-t', end]
+        if ss is not None:
+            args += ['-ss', ss]
+        if t is not None:
+            args += ['-t', t]
         args += [
             '-i', path,
             #~ '-vcodec', 'mpeg2video',
@@ -87,7 +84,8 @@ class main:
             x.setdefault(s['codec_type'], []).append((s, sa))
         x['audio'].sort(key=(lambda e: e[0].get('TAG:language') == 'eng'), reverse=True)
 
-        logging.debug('ffmpeg stream to args:\n%s', pprint.pprint(list(x.values())))
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug('ffmpeg stream to args:\n%s', pprint.pformat(list(x.values())))
 
         for _, l in sorted(x.items(), key=(lambda i: i[0].lower()!='video')):
             args += l[0][1]
@@ -104,7 +102,12 @@ class main:
         sys.stderr.flush() # flush that bitch
         #~ sys.exit()
 
-        raise SystemExit(subprocess.Popen(args).wait())
+        with open('transcode.log.{:d}'.format(os.getpid()), 'w') as stderr:
+            logging.info('Logging transcoder output to %r', stderr.name)
+            child = subprocess.Popen(args, stderr=stderr)
+            sys.stdout.close()
+            os.close(1)
+            raise SystemExit(child.wait())
 
 
 main()
