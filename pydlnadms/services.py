@@ -55,6 +55,8 @@ for service, domain, version, actions, statevars in [
                     ('BrowseFlag', 'in', 'A_ARG_TYPE_BrowseFlag'),
                     ('StartingIndex', 'in', 'A_ARG_TYPE_Index'),
                     ('RequestedCount', 'in', 'A_ARG_TYPE_Count'),
+                    ('Filter', 'in', 'A_ARG_TYPE_Filter'),
+                    ('SortCriteria', 'in', 'A_ARG_TYPE_SortCriteria'),
                     ('Result', 'out', 'A_ARG_TYPE_Result'),
                     ('NumberReturned', 'out', 'A_ARG_TYPE_Count'),
                     ('TotalMatches', 'out', 'A_ARG_TYPE_Count')])], [
@@ -63,7 +65,9 @@ for service, domain, version, actions, statevars in [
                 ('A_ARG_TYPE_BrowseFlag', 'string', [
                     'BrowseMetadata', 'BrowseDirectChildren']),
                 ('A_ARG_TYPE_Index', 'ui4'),
-                ('A_ARG_TYPE_Count', 'ui4')]),
+                ('A_ARG_TYPE_Count', 'ui4'),
+                ('A_ARG_TYPE_Filter', 'string'),
+                ('A_ARG_TYPE_SortCriteria', 'string'),]),
             ('ConnectionManager', None, 1, (), ()),
             #('X_MS_MediaReceiverRegistrar', 'microsoft.com', 1, (), ()),
         ]:
